@@ -26,28 +26,47 @@ The model is trained using **Masked Language Modeling (MLM)** on a **mixed RNA d
 
 ### 1. Environment Setup
 
-#### Option 1 (Recommended: Conda)
-
-```bash
-conda env create -f caduceus_env.yml
-conda activate caduceus_env
-```
-
-#### Option 2 (pip)
-
 ```bash
 pip install -r requirements.txt
 ```
 
 ---
 
-### 2. Prepare Directories
+## 2.⚠️ Special Dependencies
+
+This project depends on two **non-standard packages**:
+
+### 1. causal-conv1d
+
+- Required by Mamba architecture
+- May fail if built from source
+- Recommended for manual installatio
+
+✅ Recommended install:
 
 ```bash
-mkdir -p outputs
-mkdir -p checkpoints_best
-mkdir -p checkpoints_periodic
+pip install causal-conv1d==1.2.0.post2 --no-build-isolation
+or
+pip install https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.2.0.post2/causal_conv1d-1.2.0.post2+cu122torch2.2cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
 ```
+
+---
+
+### 2. mamba_ssm
+
+- Core implementation of Mamba (State Space Model)
+- Required for model to run
+- Recommended for manual installation
+
+```bash
+pip install mamba_ssm/mamba_ssm-1.2.2+cu122torch2.2cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+```
+
+If installation fails, check:
+
+- Python = 3.10
+- PyTorch = 2.2.x
+- CUDA = 12.x
 
 ---
 
@@ -65,9 +84,35 @@ data/
 
 ### 4. Run Training
 
+### Single GPU
+
 ```bash
-CUDA_VISIBLE_DEVICES=1 python -m train \
+CUDA_VISIBLE_DEVICES=0 python -m train ...
+```
+
+---
+
+### ⭐ Multi-GPU Training
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python -m train \
+trainer.devices=2 \
+trainer.accelerator=gpu \
+...
+```
+
+📌 Notes:
+
+- `CUDA_VISIBLE_DEVICES=0,1` → select GPUs
+- `trainer.devices=2` → number of GPUs
+- Uses **DDP (DistributedDataParallel)** automatically
+- Make sure batch size fits GPU memor
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python -m train \
 experiment=hg38/hg38 \
+trainer.devices=2 \
+trainer.accelerator=gpu \
 dataset.dataset_name=mixed_rna \
 +dataset.text_file=data/data-random_15K_sequences.txt \
 +dataset.rna_fasta_file=data/rnacentral_small_ATCG_only.fasta \
@@ -135,8 +180,8 @@ train.ckpt=checkpoints/last.ckpt
 
 ### 7. Final Evaluation
 
-- Automatically loads best checkpoint  
-- Runs test set evaluation  
+- Automatically loads best checkpoint
+- Runs test set evaluation
 
 ---
 
@@ -144,23 +189,23 @@ train.ckpt=checkpoints/last.ckpt
 
 ### Data Sources
 
-- Coding RNA (TXT)  
-- Non-coding RNA (FASTA)  
+- Coding RNA (TXT)
+- Non-coding RNA (FASTA)
 
 ### Preprocessing
 
-- Uppercase conversion  
-- Replace T → U  
-- Keep {A, U, C, G}  
-- Remove invalid sequences  
+- Uppercase
+- T → U
+- Keep {A, U, C, G}
+- Remove invalid sequences
 
 ### Split
 
 | Split | Ratio |
-|------|------|
+| --- | --- |
 | Train | 80% |
-| Val   | 10% |
-| Test  | 10% |
+| Val | 10% |
+| Test | 10% |
 
 ---
 
@@ -172,8 +217,8 @@ dataset.kmer = 1
 dataset.frame = 0
 ```
 
-- Character-level tokenizer  
-- EOS token appended  
+- Character-level tokenizer
+- EOS appended
 
 ---
 
@@ -185,17 +230,17 @@ model = caduceus
 
 ### Architecture
 
-- Mamba (State Space Model)  
-- Bidirectional  
-- Memory-augmented  
+- Mamba (state space model)
+- Bidirectional
+- Memory-augmented
 
 ### Key Parameters
 
-| Parameter  | Value |
-|-----------|------|
-| d_model   | 768  |
-| n_layer   | 12   |
-| vocab_size| 12   |
+| Parameter | Value |
+| --- | --- |
+| d_model | 768 |
+| n_layer | 12 |
+| vocab_size | 12 |
 
 ---
 
@@ -206,11 +251,11 @@ dataset.mlm = true
 dataset.mlm_probability = 0.15
 ```
 
-Masking strategy:
+Masking:
 
-- 80% → mask  
-- 10% → random token  
-- 10% → unchanged  
+- 80% → mask
+- 10% → random
+- 10% → unchanged
 
 ---
 
@@ -218,30 +263,34 @@ Masking strategy:
 
 ### Batch
 
-| Setting        | Value |
-|---------------|------|
-| batch size     | 16   |
-| accumulation   | 16   |
-| global batch   | 256  |
+| Setting | Value |
+| --- | --- |
+| batch size | 16 |
+| accumulation | 16 |
+| global batch | 256 |
+
+---
 
 ### Optimizer
 
-- AdamW  
-- Learning rate = 8e-5  
-- Weight decay = 0.01  
+- AdamW
+- LR = 8e-5
+- weight_decay = 0.01
+
+---
 
 ### Scheduler
 
-- Cosine warmup (timm)  
-- Warmup steps = 4000  
+- Cosine warmup (timm)
+- warmup = 4000
 
 ---
 
 ## 7. Training Procedure
 
-- Train on full dataset  
-- Validate every epoch  
-- Save checkpoints  
+- Train → full dataset
+- Validate → each epoch
+- Save checkpoints
 
 ---
 
@@ -249,17 +298,30 @@ Masking strategy:
 
 ### Best Checkpoint
 
-- Metric: `val/loss`  
+- Metric: `val/loss`
+- Path:
 
 ```
 ./checkpoints_best/val/loss.ckpt
 ```
 
-### Periodic Checkpoint
+---
 
-```
+### Periodic Checkpoint (Custom)
+
+We implement **epoch-based periodic saving**:
+
+```python
 every_n_epochs = max_epochs // 10
 ```
+
+Example:
+
+| max_epochs | interval |
+| --- | --- |
+| 50 | 5 |
+| 100 | 10 |
+| 200 | 20 |
 
 Saved to:
 
@@ -267,21 +329,42 @@ Saved to:
 ./checkpoints_periodic/
 ```
 
+Format:
+
+```
+epoch05.ckpt
+epoch10.ckpt
+...
+```
+
+Notes:
+
+- `save_top_k = -1` → save all periodic checkpoints
+- No metric filtering
+
 ---
 
 ## 9. Training Behavior
 
-- 1 epoch ≈ 1528 steps  
-- global_step = optimizer updates  
-- 1 step = 16 batches  
+- 1 epoch ≈ 1528 steps
+- global_step = optimizer updates
+- 1 step = 16 batches
+
+Example:
+
+```
+Epoch 0 → global_step ≈ 93
+```
 
 ---
 
 ## 10. Important Notes
 
-- Not a classification task  
-- Tokenizer must match between training and inference  
-- `experiment=hg38/hg38` is used as configuration template  
+⚠ Not a classification task
+
+⚠ Tokenizer must match between training and inference
+
+⚠ `experiment=hg38/hg38` is used as config template
 
 ---
 
@@ -293,7 +376,7 @@ Based on the original **Caduceus** repository.
 
 ## 12. Citation
 
-```bibtex
+```
 @article{schiff2024caduceus,
   title={Caduceus: Bi-Directional Equivariant Long-Range DNA Sequence Modeling},
   author={Schiff et al.},
@@ -302,15 +385,3 @@ Based on the original **Caduceus** repository.
 ```
 
 ---
-
-## 📢 Install Mamba (Required)
-
-```bash
-pip install mamba_ssm
-```
-
-If installation fails, check:
-
-- Python 3.10  
-- PyTorch 2.2.x  
-- CUDA 12.x  # mamba-for-RNA
