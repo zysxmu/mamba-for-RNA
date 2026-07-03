@@ -23,5 +23,4 @@ def test_writer_only():
     print("entry device:", entry.device)
     print("aux keys:", aux.keys())
 
-    # pytest 风格断言（可选，但强烈推荐）
     assert entry.shape == (B, 128)

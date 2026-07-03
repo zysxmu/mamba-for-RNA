@@ -26,7 +26,7 @@ def read_sequences(path: str):
         return seqs
 
     else:
-        # 默认按 txt：一行一条序列
+        # Treat other extensions as one-sequence-per-line text files.
         seqs = []
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
@@ -63,22 +63,25 @@ def main(path: str):
         else:
             good_count += 1
 
-    print(f"文件: {path}")
-    print(f"总序列数: {total}")
-    print(f"合法序列数(仅ATCG): {good_count}")
-    print(f"非法序列数: {bad_count}")
-    print(f"空序列数: {empty_count}")
+    print(f"File: {path}")
+    print(f"Total sequences: {total}")
+    print(f"Valid sequences (ATCG only): {good_count}")
+    print(f"Invalid sequences: {bad_count}")
+    print(f"Empty sequences: {empty_count}")
 
     if bad_count == 0:
-        print("结论: 这个数据集全是正常DNA序列（只含ATCG）")
+        print("Result: all sequences contain only ATCG.")
     else:
-        print("结论: 这个数据集里还有非法序列")
-        print("\n前10个非法样本示例：")
+        print("Result: the dataset contains invalid sequences.")
+        print("\nFirst 10 invalid examples:")
         for idx, seq, bad_chars in bad_examples:
-            print(f"- 第 {idx+1} 条: 非法字符={sorted(list(bad_chars))} | 序列前100bp={seq}")
+            print(
+                f"- Record {idx + 1}: invalid characters={sorted(bad_chars)} "
+                f"| first 100 bases={seq}"
+            )
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print("用法: python check_dna_dataset.py <你的数据文件>")
+        print("Usage: python check_dna_dataset.py <data-file>")
         sys.exit(1)
     main(sys.argv[1])

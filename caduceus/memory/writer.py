@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 class BidirectionalMemoryWriter(nn.Module):
     """
-    从 (h_fwd, h_bwd) 生成对齐的 memory entry：
+    Build an aligned memory entry from forward and backward hidden states:
       s_fwd = summarize(h_fwd)
       s_bwd = summarize(h_bwd)
       s = gate(s_fwd, s_bwd)
@@ -24,11 +24,11 @@ class BidirectionalMemoryWriter(nn.Module):
         self.pool = pool
         self.gate = gate
 
-        # summarize：把 token-level hidden -> summary 向量
+        # Project token-level hidden states into summary vectors.
         self.proj_fwd = nn.Linear(d_model, d_sum)
         self.proj_bwd = nn.Linear(d_model, d_sum)
 
-        # gate：融合 fwd/bwd
+        # Learn how much each direction contributes to the summary.
         if gate == "scalar":
             self.gate_mlp = nn.Sequential(
                 nn.Linear(2 * d_sum, d_sum),
@@ -44,20 +44,20 @@ class BidirectionalMemoryWriter(nn.Module):
         else:
             raise ValueError(f"Unknown gate: {gate}")
 
-        # compress：把 summary 压缩成 memory entry
+        # Compress the fused summary into a memory entry.
         self.compress = nn.Sequential(
             nn.Linear(d_sum, d_sum),
             nn.GELU(),
             nn.Linear(d_sum, d_mem),
         )
 
-        # 可选：归一化让相似度检索更稳
+        # Normalize entries to stabilize similarity-based retrieval.
         self.norm = nn.LayerNorm(d_mem)
 
     def _pool(self, h: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
         """
         h: [B, L, D]
-        attn_mask: [B, L] (1=valid, 0=pad) 可选
+        attn_mask: optional [B, L] tensor (1=valid, 0=padding)
         """
         if self.pool == "mean":
             if attn_mask is None:
@@ -93,7 +93,7 @@ class BidirectionalMemoryWriter(nn.Module):
         entry = self.compress(s)                  # [B, d_mem]
         entry = self.norm(entry)
 
-        # 调试/可视化时会很有用
+        # Expose intermediate values for diagnostics and visualization.
         aux = {
             "s_fwd": s_fwd,
             "s_bwd": s_bwd,

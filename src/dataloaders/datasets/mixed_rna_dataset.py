@@ -116,7 +116,6 @@ class MixedRNADataset(Dataset):
         seq = seq.strip().upper().replace("T", "U")
         allowed = {"A", "U", "C", "G"}
 
-        # 如果有非法字符 → 整条丢弃
         if any(ch not in allowed for ch in seq):
             return ""
 

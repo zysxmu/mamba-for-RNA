@@ -116,7 +116,7 @@ class BiMambaWrapper(nn.Module):
         self.bidirectional = bidirectional
         self.bidirectional_strategy = bidirectional_strategy
 
-        # 注意：mamba_kwargs 里会包含 layer_idx/device/dtype 以及 ssm_cfg 展开的参数
+        # Includes layer_idx, device, dtype, and expanded SSM parameters.
         self.mamba_fwd = Mamba(d_model=d_model, **mamba_kwargs)
 
         self.mamba_rev = None
@@ -128,7 +128,7 @@ class BiMambaWrapper(nn.Module):
                 self.mamba_rev.out_proj.weight = self.mamba_fwd.out_proj.weight
                 self.mamba_rev.out_proj.bias = self.mamba_fwd.out_proj.bias
 
-        # 缓存两路输出给 memory sidecar
+        # Cache directional outputs for the memory sidecar.
         self.last_fwd = None
         self.last_bwd = None
 

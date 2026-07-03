@@ -96,7 +96,7 @@ class NumTokens(Metric):
             self.tensor_parallel_world_size = 1
 
     def update(self, preds: Tensor, target: Tensor, loss: Optional[Tensor] = None) -> None:  # type: ignore
-        # ✅ 只统计有效 label（参与 loss 的 token）
+        # Count only labels that participate in the loss.
         valid = (target != self.ignore_index)
         self.count += valid.sum().to(torch.int64) // self.tensor_parallel_world_size
 

@@ -589,11 +589,11 @@ class SequenceLightningModule(pl.LightningModule):
         return eval_loader_names, eval_loaders
 
     def val_dataloader(self):
-            #  validation loop 只跑 val，用来选 best ckpt
+            # Keep checkpoint selection restricted to validation data.
             val_loaders = self.dataset.val_dataloader(**self.hparams.loader)
             val_loader_names, val_loaders = self._eval_dataloaders_names(val_loaders, "val")
 
-            # EMA ，val 照旧复制一份
+            # Evaluate both regular and EMA weights when EMA is enabled.
             if self.hparams.train.ema > 0.0:
                 val_loader_names += [name + "/ema" for name in val_loader_names]
                 val_loaders = val_loaders + val_loaders
@@ -641,7 +641,6 @@ def create_trainer(config, **kwargs):
         if max_epochs is None and (max_steps is None or int(max_steps) <= 0):
             raise ValueError("Set either trainer.max_epochs or a positive trainer.max_steps.")
 
-        # 周期保存
         if "periodic_checkpoint" in config.callbacks:
             if max_epochs is not None:
                 save_interval = max(1, int(max_epochs) // 10)
@@ -666,7 +665,6 @@ def create_trainer(config, **kwargs):
                 f"dirpath={config.callbacks.periodic_checkpoint.get('dirpath', None)}"
             )
 
-        # best checkpoint：保留原逻辑
         if "model_checkpoint" in config.callbacks:
             if config.callbacks.model_checkpoint.get("save_top_k", None) is None:
                 config.callbacks.model_checkpoint.save_top_k = 1
@@ -683,7 +681,7 @@ def create_trainer(config, **kwargs):
             if config.get("wandb") is None and _name_ in ["learning_rate_monitor"]:
                 continue
 
-            # 对未注册的 periodic_checkpoint，直接按 ModelCheckpoint 实例化
+            # periodic_checkpoint is an additional ModelCheckpoint instance.
             if _name_ == "periodic_checkpoint":
                 log.info("Instantiating callback <pytorch_lightning.callbacks.ModelCheckpoint> for periodic_checkpoint")
                 callbacks.append(
@@ -755,7 +753,6 @@ def train(config):
         trainer.fit(model)
 
     if config.train.test:
-        # test 阶段只跑 true test，不混 val
         config.train.update({"remove_val_loader_in_eval": True})
         config.train.update({"remove_test_loader_in_eval": False})
 
@@ -775,7 +772,7 @@ def train(config):
                 )
                 trainer.test(model)
         else:
-            # Lightning 里可能有多个 ModelCheckpoint callback，手动找 monitor=val/loss 的那个
+            # Select the checkpoint callback that monitors the configured metric.
             best_ckpt_path = None
             for cb in trainer.callbacks:
                 if isinstance(cb, pl.callbacks.ModelCheckpoint):
