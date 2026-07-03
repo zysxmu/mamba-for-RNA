@@ -1,35 +1,44 @@
 import torch
 
+
 def test_memory_stride_counts():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(0)
 
-    from caduceus.modeling_caduceus import CaduceusMixerModel
     from caduceus.configuration_caduceus import CaduceusConfig
+    from caduceus.modeling_caduceus import CaduceusMixerModel
 
-    config = CaduceusConfig(vocab_size=128)
+    config = CaduceusConfig(
+        d_model=64,
+        n_layer=4,
+        vocab_size=128,
+        fused_add_norm=False,
+        use_memory=True,
+        memory_d_sum=32,
+        memory_d_mem=16,
+        memory_n_heads=4,
+    )
     model = CaduceusMixerModel(config).to(device).eval()
-
-    # 关键：我们在 test 里覆盖 stride
     model.memory_write_stride = 2
     model.memory_read_stride = 1
+    input_ids = torch.randint(0, config.vocab_size, (2, 16), device=device)
 
-    B, T = 2, 16
-    input_ids = torch.randint(0, config.vocab_size, (B, T), device=device)
-
+    write_calls = []
+    read_calls = []
+    write_handle = model.memory_writer.writer.register_forward_hook(
+        lambda _module, _inputs, _output: write_calls.append(1)
+    )
+    read_handle = model.memory_attn.register_forward_hook(
+        lambda _module, _inputs, _output: read_calls.append(1)
+    )
     with torch.no_grad():
         _ = model(input_ids=input_ids)
+    write_handle.remove()
+    read_handle.remove()
 
     n_layer = len(model.layers)
-    pool = model.memory_pool
-
-    print("n_layer:", n_layer)
-    print("get_calls :", pool._get_calls)
-    print("push_calls:", pool._push_calls)
-
-    # 预期：每层都读 -> get_calls == n_layer
-    assert pool._get_calls == n_layer
-
-    # 预期：i=0,2,4,... 写 -> 次数 = ceil(n_layer / 2)
-    expected_push = (n_layer + model.memory_write_stride - 1) // model.memory_write_stride
-    assert pool._push_calls == expected_push
+    expected_writes = (
+        n_layer + model.memory_write_stride - 1
+    ) // model.memory_write_stride
+    assert len(write_calls) == expected_writes
+    assert len(read_calls) == n_layer - 1

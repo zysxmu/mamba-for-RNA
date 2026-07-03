@@ -211,6 +211,7 @@ class CaduceusMixerModel(nn.Module):
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
 
+        self.config = config
         self.fused_add_norm = config.fused_add_norm
         self.rcps = config.rcps
         self.residual_in_fp32 = config.residual_in_fp32
@@ -250,33 +251,41 @@ class CaduceusMixerModel(nn.Module):
             config.d_model, eps=config.norm_epsilon, **factory_kwargs
         )
         self.norm_f = norm_f if (config.fused_add_norm or not config.rcps) else RCPSAddNormWrapper(norm_f)
-        # ---- Memory sidecar (minimal, non-invasive) ----
+        # ---- Optional memory sidecar ----
+        if config.rcps and config.use_memory:
+            raise ValueError(
+                "The current memory sidecar is not reverse-complement equivariant. "
+                "Set use_memory=false when rcps=true."
+            )
+        self.use_memory = config.use_memory
+        self.memory_persist_across_batches = config.memory_persist_across_batches
         hidden_dim = config.d_model * (2 if config.rcps else 1)
 
-        self.memory_writer = MemoryWriterWrapper(
-            d_model=hidden_dim,
-            d_sum=256,
-            d_mem=128,
-            pool="mean",
-            gate="scalar",
-        )
+        if self.use_memory:
+            self.memory_writer = MemoryWriterWrapper(
+                d_model=hidden_dim,
+                d_sum=config.memory_d_sum,
+                d_mem=config.memory_d_mem,
+                pool="mean",
+                gate="scalar",
+            )
+            self.memory_pool = MemoryPool(max_size=config.memory_max_size)
+            self.memory_attn = MemoryCrossAttention(
+                d_model=hidden_dim,
+                d_mem=config.memory_d_mem,
+                n_heads=config.memory_n_heads,
+            )
+            self.memory_write_stride = config.memory_write_stride
+            self.memory_read_stride = config.memory_read_stride
 
-        # ---- Memory pool ----
-        self.memory_pool = MemoryPool(max_size=32)
-
-        # ---- Memory cross-attention ----
-        self.memory_attn = MemoryCrossAttention(
-            d_model=hidden_dim,
-            d_mem=128,
-            n_heads=4,
-        )
-        # ---- Memory schedule (write/read stride) ----
-        self.memory_write_stride = getattr(config, "memory_write_stride", 6)  # 默认每6层写一次
-        self.memory_read_stride = getattr(config, "memory_read_stride", 2)  # 默认每2层写一次
-
-    def forward(self, input_ids, inputs_embeds=None, output_hidden_states=False):
-        # ---- Reset memory between batches (training only) ----
-        if self.training:
+    def forward(
+        self,
+        input_ids,
+        inputs_embeds=None,
+        attention_mask=None,
+        output_hidden_states=False,
+    ):
+        if self.use_memory and not self.memory_persist_across_batches:
             self.memory_pool.reset()
 
         all_hidden_states = []
@@ -286,9 +295,22 @@ class CaduceusMixerModel(nn.Module):
         else:
             hidden_states = self.embeddings(input_ids)
 
+        if attention_mask is None and input_ids is not None:
+            pad_token_id = getattr(self.config, "pad_token_id", None)
+            if pad_token_id is not None:
+                attention_mask = input_ids.ne(pad_token_id)
+
         residual = None
 
-        # ✅ local：只在本次 forward 存带图 entry（让 writer/attn 能训练）
+        # Snapshot only entries from earlier batches. Entries written below are
+        # read through local_entries so their writer graph remains trainable.
+        memory_global = None
+        if self.use_memory and self.memory_persist_across_batches:
+            memory_global = self.memory_pool.get()
+            if memory_global is not None and memory_global.shape[0] != hidden_states.shape[0]:
+                self.memory_pool.reset()
+                memory_global = None
+
         local_entries = []
 
         for i, layer in enumerate(self.layers):
@@ -297,40 +319,43 @@ class CaduceusMixerModel(nn.Module):
 
             hidden_states, residual = layer(hidden_states, residual, inference_params=None)
 
-            # ---- Memory sidecar write ----
-            bim = _get_bimamba_from_layer(layer)
-            if bim is not None:
-                entry, aux = self.memory_writer.writer(bim.last_fwd, bim.last_bwd, attn_mask=None)
-            else:
-                entry, aux = self.memory_writer(hidden_states, attn_mask=None)
+            if self.use_memory:
+                # Read only memories that existed before this layer. This avoids
+                # letting a layer attend to a summary of its own output.
+                memory_local = (
+                    torch.stack(local_entries, dim=1)
+                    if local_entries else None
+                )
+                if memory_global is None:
+                    memory = memory_local
+                elif memory_local is None:
+                    memory = memory_global
+                else:
+                    memory = torch.cat([memory_global, memory_local], dim=1)
 
-            # ---- 1) write memory ----
-            if (i % self.memory_write_stride) == 0:
-                #  本 step 用：保留图
-                local_entries.append(entry)
+                if (
+                    memory is not None
+                    and memory.shape[1] > 0
+                    and (i % self.memory_read_stride) == 0
+                ):
+                    hidden_states = hidden_states + self.memory_attn(hidden_states, memory)
 
-                #  跨 step 用：断图存进 pool
-                self.memory_pool.push(entry)
-            # ---- Read memory at stride ----
-            memory_global = self.memory_pool.get()
-
-            memory_local = None
-            if len(local_entries) > 0:
-                memory_local = torch.stack(local_entries, dim=1)
-
-            if memory_global is None:
-                memory = memory_local
-            elif memory_local is None:
-                memory = memory_global
-            else:
-                memory = torch.cat([memory_global, memory_local], dim=1)
-
-            if memory is not None and memory.shape[1] > 0 and (i % self.memory_read_stride) == 0:
-                mem_ctx = self.memory_attn(hidden_states, memory)
-                hidden_states = hidden_states + mem_ctx
-
-                if residual is not None:
-                    residual = residual + mem_ctx
+                if (i % self.memory_write_stride) == 0:
+                    bim = _get_bimamba_from_layer(layer)
+                    if bim is not None:
+                        entry, _ = self.memory_writer.writer(
+                            bim.last_fwd,
+                            bim.last_bwd,
+                            attn_mask=attention_mask,
+                        )
+                    else:
+                        entry, _ = self.memory_writer(
+                            hidden_states,
+                            attn_mask=attention_mask,
+                        )
+                    local_entries.append(entry)
+                    if self.memory_persist_across_batches:
+                        self.memory_pool.push(entry)
 
         # ---- final norm  ----
         if not self.fused_add_norm:
@@ -463,11 +488,6 @@ class Caduceus(CaduceusPreTrainedModel):
         self.config = config
         factory_kwargs = {"device": device, "dtype": dtype}
 
-        self.embeddings = CaduceusEmbeddings(
-        config,
-        **factory_kwargs
-        )
-
         self.backbone = CaduceusMixerModel(
             config,
             **factory_kwargs,
@@ -478,6 +498,7 @@ class Caduceus(CaduceusPreTrainedModel):
             self,
             input_ids: torch.LongTensor = None,
             inputs_embeds: Optional[torch.FloatTensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
     ) -> Union[torch.Tensor, Tuple, BaseModelOutputWithNoAttention]:
@@ -491,14 +512,10 @@ class Caduceus(CaduceusPreTrainedModel):
             else self.config.use_return_dict
         )
 
-        if inputs_embeds is not None:
-            hidden_states = inputs_embeds
-        else:
-            hidden_states = self.embeddings(input_ids)
-
         hidden_states, all_hidden_states = self.backbone(
-            input_ids=None,
-            inputs_embeds=hidden_states,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
             output_hidden_states=output_hidden_states
         )
 
@@ -539,12 +556,12 @@ class CaduceusForMaskedLM(CaduceusPreTrainedModel):
         self.post_init()
 
     def get_input_embeddings(self):
-        return self.caduceus.embeddings.word_embeddings
+        return self.caduceus.backbone.embeddings.word_embeddings
 
     def set_input_embeddings(self, value):
         if self.config.rcps:
             raise NotImplementedError("Setting input embeddings for RCPS LM is not supported.")
-        self.caduceus.embeddings.word_embeddings = value
+        self.caduceus.backbone.embeddings.word_embeddings = value
 
     def get_output_embeddings(self):
         return self.lm_head
@@ -574,6 +591,7 @@ class CaduceusForMaskedLM(CaduceusPreTrainedModel):
             self,
             input_ids: torch.LongTensor = None,
             inputs_embeds: Optional[torch.FloatTensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
             labels: Optional[torch.LongTensor] = None,
             loss_weights: Optional[torch.FloatTensor] = None,
             output_hidden_states: Optional[bool] = None,
@@ -590,6 +608,7 @@ class CaduceusForMaskedLM(CaduceusPreTrainedModel):
         outputs = self.caduceus(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )

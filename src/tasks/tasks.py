@@ -60,7 +60,13 @@ class BaseTask:
 
         for name in self.torchmetric_names:
             if name in tm_mine:
-                tracked_torchmetrics[name] = tm_mine[name]()
+                metric_kwargs = {}
+                if name in {"perplexity", "num_tokens"}:
+                    tokenizer = getattr(self.dataset, "tokenizer", None)
+                    metric_kwargs["ignore_index"] = getattr(
+                        tokenizer, "pad_token_id", -100
+                    )
+                tracked_torchmetrics[name] = tm_mine[name](**metric_kwargs)
             elif name in ['AUROC', 'StatScores', 'Precision', 'Recall', 'F1', 'F1Score']:
                 tracked_torchmetrics[name] = getattr(tm, name)(
                     average='macro', num_classes=self.dataset.d_output, compute_on_step=False
@@ -191,9 +197,12 @@ class LMTask(BaseTask):
         if hasattr(x, "logits"):
             x = x.logits  # [B, L, V]
 
-        # next-token LM shift
-        x = x[:, :-1, :]
-        y = y[:, 1:]
+        # MLM predicts each masked token at the same position. Autoregressive
+        # language modelling predicts the next token and therefore needs a
+        # one-position shift.
+        if not getattr(self.dataset, "mlm", False):
+            x = x[:, :-1, :]
+            y = y[:, 1:]
 
         x = rearrange(x, "... C -> (...) C")
         y = rearrange(y, "... -> (...)")

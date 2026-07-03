@@ -159,9 +159,6 @@ class SequenceLightningModule(pl.LightningModule):
 
 
     def setup(self, stage=None):
-        if not self.hparams.train.disable_dataset:
-            self.dataset.setup()
-
         # We need to set up the model in setup() because for some reason when training with DDP, one GPU uses much more
         # memory than the others.
         # In order to not overwrite the model multiple times during different stages, we need this hack
@@ -171,6 +168,9 @@ class SequenceLightningModule(pl.LightningModule):
             return
         else:
             self._has_setup = True
+
+        if not self.hparams.train.disable_dataset:
+            self.dataset.setup()
 
         # Convenience feature: if model specifies encoder, combine it with main encoder
         encoder_cfg = utils.to_list(self.hparams.encoder) + utils.to_list(
@@ -636,15 +636,24 @@ def create_trainer(config, **kwargs):
     # --------------------------------------------------
     if "callbacks" in config:
         max_epochs = config.trainer.get("max_epochs", None)
+        max_steps = config.trainer.get("max_steps", None)
 
-        if max_epochs is None:
-            raise ValueError("必须设置 trainer.max_epochs，老师要求按 epoch 定期保存 checkpoint。")
-
-        save_every_n_epochs = max(1, int(max_epochs) // 10)
+        if max_epochs is None and (max_steps is None or int(max_steps) <= 0):
+            raise ValueError("Set either trainer.max_epochs or a positive trainer.max_steps.")
 
         # 周期保存
         if "periodic_checkpoint" in config.callbacks:
-            config.callbacks.periodic_checkpoint.every_n_epochs = save_every_n_epochs
+            if max_epochs is not None:
+                save_interval = max(1, int(max_epochs) // 10)
+                config.callbacks.periodic_checkpoint.every_n_epochs = save_interval
+                config.callbacks.periodic_checkpoint.pop("every_n_train_steps", None)
+                interval_description = f"every_n_epochs={save_interval}"
+            else:
+                save_interval = max(1, int(max_steps) // 10)
+                config.callbacks.periodic_checkpoint.every_n_epochs = 0
+                config.callbacks.periodic_checkpoint.every_n_train_steps = save_interval
+                config.callbacks.periodic_checkpoint.filename = "step{step:06d}"
+                interval_description = f"every_n_train_steps={save_interval}"
             config.callbacks.periodic_checkpoint.save_top_k = -1
             config.callbacks.periodic_checkpoint.save_last = False
 
@@ -652,8 +661,8 @@ def create_trainer(config, **kwargs):
                 config.callbacks.periodic_checkpoint.filename = "epoch{epoch:02d}"
 
             log.info(
-                f"[Periodic Checkpoint] max_epochs={max_epochs}, "
-                f"every_n_epochs={save_every_n_epochs}, save_top_k=-1, "
+                f"[Periodic Checkpoint] max_epochs={max_epochs}, max_steps={max_steps}, "
+                f"{interval_description}, save_top_k=-1, "
                 f"dirpath={config.callbacks.periodic_checkpoint.get('dirpath', None)}"
             )
 
@@ -711,6 +720,8 @@ def create_trainer(config, **kwargs):
 
 
 def fsspec_exists(filename):
+    if filename is None:
+        return False
     fs, _ = fsspec.core.url_to_fs(filename)
     return fs.exists(filename)
 

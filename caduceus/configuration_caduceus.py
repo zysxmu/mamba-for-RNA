@@ -36,8 +36,15 @@ class CaduceusConfig(PretrainedConfig):
             rcps: bool = False,
             complement_map: Optional[dict] = None,  # used for RCPSEmbedding / RCPSLMHead
 
-            # New memory-related parameter
-            use_memory: bool = False,  # <-- New field
+            # Memory sidecar
+            use_memory: bool = False,
+            memory_d_sum: int = 256,
+            memory_d_mem: int = 128,
+            memory_n_heads: int = 4,
+            memory_write_stride: int = 6,
+            memory_read_stride: int = 2,
+            memory_max_size: int = 32,
+            memory_persist_across_batches: bool = False,
 
             **kwargs,
     ):
@@ -58,5 +65,11 @@ class CaduceusConfig(PretrainedConfig):
         self.rcps = rcps
         self.complement_map = complement_map
         
-        # Add the new field for use_memory
         self.use_memory = use_memory
+        self.memory_d_sum = memory_d_sum
+        self.memory_d_mem = memory_d_mem
+        self.memory_n_heads = memory_n_heads
+        self.memory_write_stride = memory_write_stride
+        self.memory_read_stride = memory_read_stride
+        self.memory_max_size = memory_max_size
+        self.memory_persist_across_batches = memory_persist_across_batches

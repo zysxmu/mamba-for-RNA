@@ -43,13 +43,14 @@ class Perplexity(Metric):
     total_log_probs: Tensor
     count: Tensor
 
-    def __init__(self, **kwargs: Dict[str, Any]):
+    def __init__(self, ignore_index: int = -100, **kwargs: Dict[str, Any]):
         super().__init__(**kwargs)
+        self.ignore_index = ignore_index
         self.add_state("total_log_probs", default=torch.tensor(0.0, dtype=torch.float64),
                        dist_reduce_fx="sum")
         self.add_state("count", default=torch.tensor(0, dtype=torch.int64), dist_reduce_fx="sum")
 
-        self.loss_fn = CrossEntropyLoss()
+        self.loss_fn = CrossEntropyLoss(ignore_index=ignore_index)
 
     def update(self, preds: Tensor, target: Tensor, loss: Optional[Tensor] = None) -> None:  # type: ignore
         """Compute and store intermediate statistics for Perplexity.
@@ -59,7 +60,9 @@ class Perplexity(Metric):
             target:
                 Ground truth values with a shape [batch_size, seq_len].
         """
-        count = target.numel()
+        count = (target != self.ignore_index).sum()
+        if count == 0:
+            return
         if loss is None:
             loss = self.loss_fn(preds, target)
         self.total_log_probs += loss.double() * count
@@ -100,11 +103,6 @@ class NumTokens(Metric):
 
     def compute(self) -> Tensor:
         return self.count
-
-    def reset(self):
-        count = self.count
-        super().reset()
-        self.count = count
 
     # Adapted from https://github.com/Lightning-AI/metrics/blob/master/src/torchmetrics/metric.py
     def _forward_reduce_state_update(self, *args: Any, **kwargs: Any) -> Any:

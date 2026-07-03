@@ -9,6 +9,7 @@
 import copy
 from typing import Any
 import torch
+from hydra.utils import to_absolute_path
 from torch.utils.data import DataLoader, Subset
 
 from caduceus.tokenization_caduceus import CaduceusTokenizer
@@ -64,6 +65,10 @@ class HG38(SequenceDataset):
         self.dataset_name = kwargs.pop("dataset_name", None)
         self.text_file = kwargs.pop("text_file", None)
         self.rna_fasta_file = kwargs.pop("rna_fasta_file", None)
+        if self.text_file is not None:
+            self.text_file = to_absolute_path(self.text_file)
+        if self.rna_fasta_file is not None:
+            self.rna_fasta_file = to_absolute_path(self.rna_fasta_file)
         self.ignore_id = kwargs.pop("ignore_id", None)
         self.kmer = kwargs.pop("kmer", 1)
         self.frame = kwargs.pop("frame", 0)
@@ -309,50 +314,26 @@ class HG38(SequenceDataset):
 
             train_idx, val_idx, test_idx = self._make_splits(len(base_dataset))
 
-            train_ds = MixedRNADataset(
-                tokenizer=self.tokenizer,
-                text_file=self.text_file,
-                fasta_file=self.rna_fasta_file,
-                max_length=self.max_length,
-                add_eos=self.add_eos,
-                mlm=self.mlm,
-                mlm_probability=self.mlm_probability,
-                ignore_id=ignore_id,
-                kmer=self.kmer,
-                frame=self.frame,
-                max_text_sequences=self.max_text_sequences,
-                max_fasta_sequences=self.max_fasta_sequences,
-            )
+            # Shallow copies share the immutable sequence/source lists. This
+            # avoids parsing and storing the complete corpus three more times
+            # in every DDP process.
+            train_ds = copy.copy(base_dataset)
+            val_ds = copy.copy(base_dataset)
+            test_ds = copy.copy(base_dataset)
 
-            val_ds = MixedRNADataset(
-                tokenizer=self.tokenizer,
-                text_file=self.text_file,
-                fasta_file=self.rna_fasta_file,
-                max_length=self.max_length_val,
-                add_eos=self.add_eos,
-                mlm=self.mlm,
-                mlm_probability=self.mlm_probability,
-                ignore_id=ignore_id,
-                kmer=self.kmer,
-                frame=self.frame,
-                max_text_sequences=self.max_text_sequences,
-                max_fasta_sequences=self.max_fasta_sequences,
-            )
+            train_ds.max_length = self.max_length
+            train_ds.mlm = self.mlm
+            train_ds.deterministic_mlm = False
 
-            test_ds = MixedRNADataset(
-                tokenizer=self.tokenizer,
-                text_file=self.text_file,
-                fasta_file=self.rna_fasta_file,
-                max_length=self.max_length_test,
-                add_eos=self.add_eos,
-                mlm=self.mlm,
-                mlm_probability=self.mlm_probability,
-                ignore_id=ignore_id,
-                kmer=self.kmer,
-                frame=self.frame,
-                max_text_sequences=self.max_text_sequences,
-                max_fasta_sequences=self.max_fasta_sequences,
-            )
+            val_ds.max_length = self.max_length_val
+            val_ds.mlm = self.mlm
+            val_ds.deterministic_mlm = True
+            val_ds.mlm_seed = self.val_split_seed + 10_000
+
+            test_ds.max_length = self.max_length_test
+            test_ds.mlm = self.mlm
+            test_ds.deterministic_mlm = True
+            test_ds.mlm_seed = self.val_split_seed + 20_000
 
             self.dataset_train = Subset(train_ds, train_idx)
             self.dataset_val = Subset(val_ds, val_idx)

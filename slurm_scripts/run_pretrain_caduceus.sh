@@ -50,6 +50,7 @@ srun python -m train \
   model.config.bidirectional_strategy=${BIDIRECTIONAL_STRATEGY} \
   model.config.bidirectional_weight_tie=${BIDIRECTIONAL_WEIGHT_TIE} \
   model.config.rcps=${RCPS} \
+  model.config.use_memory=false \
   optimizer.lr="${LR}" \
   train.global_batch_size=${BATCH_SIZE} \
   trainer.max_steps=${MAX_STEPS} \
