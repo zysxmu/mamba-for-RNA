@@ -439,6 +439,12 @@ class HG38(SequenceDataset):
             self.fast_forward_batches = checkpoint["loops"]["fit_loop"]["epoch_loop.batch_progress"]["current"]["completed"]
 
 
+class RNA(HG38):
+    """RNA-specific registry name for the mixed-RNA pretraining data module."""
+
+    _name_ = "rna"
+
+
 class GenomicBenchmark(HG38):
     _name_ = "genomic_benchmark"
     l_output = 0

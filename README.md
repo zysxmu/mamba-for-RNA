@@ -1,58 +1,61 @@
-# Caduceus-RNA
+# RNA-Mamba
 
-Memory-augmented bidirectional Mamba for RNA masked language modeling (MLM).
-The project pretrains on a mixed corpus of coding RNA in TXT format and
-non-coding RNA in FASTA format.
+RNA-Mamba is a memory-augmented bidirectional Mamba model for RNA masked
+language modeling. It uses the Caduceus BiMamba backbone and adds two
+RNA-specific components:
 
-## Status
+1. **Bidirectional Consistent Writing (BCW)** aligns forward and backward
+   states at the same RNA position and learns a feature-wise directional
+   fusion.
+2. **Cross-layer multi-slot memory** compresses the fused states into global
+   and regional slots that later layers read through gated cross-attention.
 
-The complete training pipeline has been validated on an RTX 4060 Laptop GPU,
-including:
+The implementation is intended for reproducible pretraining, ablation studies,
+and multi-GPU Slurm runs.
 
-- RNA loading, normalization, and deterministic data splitting;
-- dynamic MLM masking;
-- bidirectional Mamba and memory cross-attention;
-- forward and backward passes with optimizer updates;
-- validation, testing, checkpoint saving, and checkpoint restoration.
+## Architecture
 
-A one-epoch reference run on the current local corpus used `d_model=768`,
-12 layers, sequence length 1024, and a global batch size of 256:
-
-| Metric | Result |
-| --- | ---: |
-| Training loss | 1.690 |
-| Validation loss | 1.280 |
-| Validation perplexity | 3.610 |
-
-These values confirm that the implementation trains and the loss decreases.
-They are not intended as final biological benchmarks.
-
-## Requirements
-
-CUDA training requires Linux, either natively, on a Linux cluster, or through
-WSL2.
-
-- Python 3.10
-- PyTorch 2.2.0 with CUDA 12.1
-- `causal-conv1d==1.2.0.post2`
-- `mamba-ssm==1.2.2`
-- An NVIDIA GPU
-
-Create the recommended environment with:
-
-```bash
-bash setup_linux_env.sh
-source .venv/bin/activate
+```text
+RNA tokens [B, L]
+  -> BiMamba layer
+     -> aligned forward states  [B, L, d_model]
+     -> aligned backward states [B, L, d_model]
+  -> read memory written by earlier layers
+  -> BCW directional fusion     [B, L, d_sum]
+  -> global + regional pooling  [B, S, d_mem]
+  -> FIFO cross-layer bank      [B, M, d_mem]
+  -> later token-to-memory cross-attention
+  -> same-position MLM head
 ```
 
-`requirements-core.txt` contains the minimal dependency set used by the current
-RNA training path. `requirements.txt` is the original full environment export
-and is retained for reference. The CUDA version reported by the NVIDIA driver
-may be newer than the CUDA 12.1 runtime bundled with PyTorch.
+Each layer reads before it writes, so a layer cannot read its own newly created
+slots. Memory exists only inside one forward pass and is never shared between
+independent RNA samples or batches. Padding is excluded from fusion statistics,
+slot pooling, and attention.
+
+## Default pretraining configuration
+
+The formal configuration is
+[`configs/experiment/rna_pretrain.yaml`](configs/experiment/rna_pretrain.yaml):
+
+- 12 BiMamba layers, `d_model=768`;
+- sequence length 1024;
+- A/U/C/G/N character tokenizer;
+- 15% same-position MLM;
+- BCW with `d_sum=256`;
+- one global and eight valid-length-aware regional slots per write layer;
+- weighted pooling and `d_mem=128`;
+- write stride 4, read stride 2, and a 64-slot FIFO bank;
+- four-head shared memory reader with an independent gate per read layer;
+- BF16, AdamW, gradient clipping, and cosine decay with warmup.
+
+The reader gates start conservatively at `-4.0` before the sigmoid. This keeps
+the pretrained backbone path dominant at initialization while still allowing
+memory gradients to flow.
 
 ## Dataset
 
-The training corpus consists of:
+Provide one TXT corpus and one FASTA corpus:
 
 ```text
 data/
@@ -60,162 +63,201 @@ data/
 └── rnacentral_small_ATCG_only.fasta
 ```
 
-- TXT input: each line starts with an RNA sequence. If a line contains commas,
-  only the first field is used.
-- FASTA input: standard multiline FASTA records are supported.
-- Normalization: sequences are uppercased and `T` is converted to `U`. Records
-  containing characters outside `A/U/C/G` are discarded.
-- Split: a fixed seed produces 80% training, 10% validation, and 10% test data.
-- Masking: training masks are generated dynamically. Validation and test masks
-  are deterministic so checkpoints can be compared consistently.
+- TXT: one sequence per line; when commas are present, only the first field is
+  used.
+- FASTA: standard multiline records are supported.
+- Input is uppercased and `T` is normalized to `U`.
+- The current mixed-RNA corpus loader retains canonical `A/U/C/G` sequences;
+  the tokenizer also contains `N` for masking and compatible inputs.
+- The split is deterministic: 80% train, 10% validation, and 10% test.
+- Training masking is dynamic; validation and test masking are deterministic.
 
-Data files are excluded by `.gitignore` and are not stored in this repository.
-Use absolute paths on storage that is accessible from every compute node.
+Data files are excluded from Git. On a cluster, use absolute paths visible from
+every compute node.
 
-## Quick smoke test
+## Installation
 
-The repository includes a small synthetic corpus for testing the complete GPU
-pipeline:
+CUDA training requires Linux, a Linux cluster, or WSL2.
+
+- Python 3.10
+- PyTorch 2.2.0 with CUDA 12.1
+- `causal-conv1d==1.2.0.post2`
+- `mamba-ssm==1.2.2`
+
+```bash
+bash setup_linux_env.sh
+source .venv/bin/activate
+```
+
+`requirements-core.txt` contains the dependencies used by the RNA pretraining
+path. `requirements.txt` retains the original full environment export.
+
+## Local smoke test
 
 ```bash
 source .venv/bin/activate
 bash run_local_smoke.sh
 ```
 
-The smoke test runs three optimizer steps and covers training, validation,
-testing, and checkpointing. Outputs are written to `outputs/local-smoke/`.
-This is a pipeline check, not a biological experiment.
+This runs a small end-to-end GPU job with training, validation, test,
+checkpoint saving, and checkpoint reload. The default output directory is
+`outputs/local-smoke/`.
 
-Run the core test suite with:
+Useful overrides:
+
+```bash
+PRECISION=bf16 MAX_STEPS=20 RUN_TEST=false \
+RUN_DIR=outputs/local-smoke-20 bash run_local_smoke.sh
+```
+
+## Ablations
+
+All variants use the same training path and can be selected with Hydra
+overrides.
+
+```bash
+# BiMamba baseline
+python -m train experiment=rna_pretrain model.config.use_memory=false
+
+# Single-direction memory writer
+python -m train experiment=rna_pretrain \
+  model.config.memory_writer_mode=single
+
+# Multi-slot memory without learned bidirectional writing
+python -m train experiment=rna_pretrain \
+  model.config.memory_writer_mode=average
+
+# Full BCW + multi-slot memory (formal default)
+python -m train experiment=rna_pretrain \
+  model.config.memory_writer_mode=bcw
+
+# One global slot only
+python -m train experiment=rna_pretrain \
+  model.config.memory_num_global_slots=1 \
+  model.config.memory_num_local_slots=0
+
+# Mean pooling without a learned write score
+python -m train experiment=rna_pretrain \
+  model.config.memory_pooling=mean \
+  model.config.memory_use_write_score=false
+```
+
+`scalar_gate`, `max` pooling, source-embedding switches, reader sharing, and
+read/write strides are also configurable in
+[`configs/model/caduceus.yaml`](configs/model/caduceus.yaml).
+
+BCW is the writer used by the memory path; a nominal "BCW-only" setting with no
+memory consumer would not affect the MLM loss and is therefore not presented
+as a valid ablation.
+
+## Slurm training
+
+The provided script launches one Slurm task per GPU. PyTorch Lightning uses the
+Slurm-provided global and local ranks to form the eight-process DDP job:
+
+```bash
+export RNA_TEXT_FILE=/shared/data/data-random_15K_sequences.txt
+export RNA_FASTA_FILE=/shared/data/rnacentral_small_ATCG_only.fasta
+export ENV_ACTIVATE='source ~/miniconda3/bin/activate rna-mamba'
+
+export NUM_DEVICES=8
+export PER_DEVICE_BATCH=16
+export GLOBAL_BATCH=256
+export MAX_STEPS=20000
+export MAX_EPOCHS=null
+export RUN_DIR=/shared/outputs/rna-mamba
+
+sbatch slurm_scripts/run_pretrain_rna.sh
+```
+
+Run a short cluster smoke test first:
+
+```bash
+export MAX_STEPS=20
+export RUN_DIR=/shared/outputs/rna-mamba-smoke
+sbatch slurm_scripts/run_pretrain_rna.sh
+```
+
+Confirm that every GPU is active, validation completes, memory use remains
+stable, and `checkpoints/last.ckpt` is written before submitting the full run.
+
+The accumulation factor is:
+
+```text
+ceil(global_batch / (nodes * devices_per_node * per_device_batch))
+```
+
+## Checkpoints
+
+Training produces:
+
+```text
+checkpoints_best/       best validation-loss checkpoint
+checkpoints_periodic/   periodic recovery checkpoints
+checkpoints/last.ckpt   latest complete training state
+resolved_config.yaml    resolved Hydra configuration
+run_metadata.json       command, Git state, seed, batch size, and parameter counts
+runtime_metrics.json    step time, throughput, and peak allocated GPU memory
+```
+
+`train.ckpt` performs an exact Lightning resume, including model, optimizer,
+scheduler, and global step. `train.pretrained_model_path` is a separate
+compatible warm-start path: matching backbone tensors are loaded and a
+structured missing/unexpected/shape-mismatch report is written for new memory
+parameters.
+
+With PyTorch Lightning 1.8, a checkpoint taken in the middle of a shuffled
+epoch does not guarantee restoration of the exact dataloader cursor. Model and
+optimizer state are restored, but a few samples may be repeated or skipped.
+Use an epoch-boundary checkpoint when exact sample order is required.
+
+## Tests
 
 ```bash
 pytest -q \
   caduceus/tests/test_writer_only.py \
+  caduceus/tests/test_memory_bank_reader.py \
   caduceus/tests/test_model_memory_smoke.py \
   caduceus/tests/test_memory_backward.py \
   caduceus/tests/test_memory_read_before_write.py \
   caduceus/tests/test_memory_stride_counts.py \
   caduceus/tests/test_memory_eval_isolation.py \
-  caduceus/tests/test_mixed_rna_dataset.py
+  caduceus/tests/test_mixed_rna_dataset.py \
+  caduceus/tests/test_mlm_alignment.py
 ```
 
-## Training on a Slurm cluster
+The suite checks alignment, padding invariance, empty slots, FIFO capacity,
+read-before-write ordering, memory-specific gradients, forward isolation, and
+same-position MLM labels.
 
-`slurm_scripts/run_pretrain_rna.sh` is the prepared entry point for a
-single-node, eight-GPU Slurm job. Cluster-specific partition names, GPU resource
-names, and environment modules may require changes to the `#SBATCH` header.
+## Current validation
 
-```bash
-export RNA_TEXT_FILE=/absolute/path/data-random_15K_sequences.txt
-export RNA_FASTA_FILE=/absolute/path/rnacentral_small_ATCG_only.fasta
-export ENV_ACTIVATE='source ~/miniconda3/bin/activate caduceus_env'
+The formal 50.3M-parameter model has completed forward and backward passes on
+an RTX 4060 Laptop GPU with BF16, sequence length 1024, and batch size 8.
+Observed peak allocated memory was approximately 4.26 GiB. A two-step
+real-corpus smoke run completed training and validation without NaN, Inf, or
+OOM. These measurements validate the execution path; they are not biological
+benchmark results.
 
-export NUM_DEVICES=8
-export PER_DEVICE_BATCH=16
-export GLOBAL_BATCH=256
-export MAX_LENGTH=1024
-export MAX_EPOCHS=null
-export MAX_STEPS=20000
-export NUM_WORKERS=4
-export RUN_DIR=/absolute/path/to/output
+True multi-GPU DDP must still be verified with the 20-step smoke job on the
+target cluster because the local machine exposes only one GPU.
 
-sbatch slurm_scripts/run_pretrain_rna.sh
-```
-
-The effective gradient accumulation factor is:
+## Project structure
 
 ```text
-ceil(GLOBAL_BATCH / (NUM_NODES * NUM_DEVICES * PER_DEVICE_BATCH))
-```
-
-Always begin with a short cluster smoke run:
-
-```bash
-export MAX_EPOCHS=null
-export MAX_STEPS=20
-export RUN_DIR=/absolute/path/to/smoke-output
-sbatch slurm_scripts/run_pretrain_rna.sh
-```
-
-Before submitting the full job, verify the Slurm log, GPU utilization, host
-memory usage, validation loss, and checkpoint creation.
-
-### Epoch and step limits
-
-PyTorch Lightning stops when either `max_epochs` or `max_steps` is reached
-first. With approximately 29,600 valid sequences and a global batch size of
-256, one epoch contains roughly 93 optimizer steps:
-
-- 50 epochs correspond to approximately 4,650 optimizer steps.
-- 20,000 optimizer steps correspond to approximately 216 epochs.
-
-Therefore, 50 epochs and 20,000 steps cannot both be treated as the final
-training target. For a 20,000-step run, set `MAX_EPOCHS=null`. For a 50-epoch
-run, adjust the cosine schedule and warmup to the resulting total step count;
-a 4,000-step warmup would otherwise cover almost the entire run.
-
-## Default model configuration
-
-- Character-level RNA tokenizer;
-- 15% same-position MLM;
-- `d_model=768` and 12 layers;
-- sequence length 1024;
-- bidirectional Mamba with additive forward/reverse fusion;
-- tied forward/reverse input and output projections;
-- hierarchical memory sidecar;
-- AdamW with learning rate `8e-5` and weight decay `0.01`;
-- FP16 mixed precision and gradient clipping at `0.5`.
-
-Memory is isolated between independent batches by default. Within one forward
-pass, a layer may read entries written by earlier layers but never its own newly
-written summary. Padding tokens are excluded from memory pooling.
-
-The current memory cross-attention is not reverse-complement equivariant.
-Consequently, the supported combinations are:
-
-```text
-use_memory=true  -> rcps=false
-rcps=true        -> use_memory=false
-```
-
-The model rejects configurations that enable both `use_memory=true` and
-`rcps=true`.
-
-## Checkpoints and resuming
-
-Training outputs include:
-
-```text
-checkpoints_best/       # Best validation-loss checkpoint
-checkpoints_periodic/   # Periodic checkpoints
-checkpoints/last.ckpt   # Most recent training state
-```
-
-The Slurm script uses:
-
-```text
-train.ckpt=checkpoints/last.ckpt
-```
-
-Training resumes when this file exists and starts from scratch otherwise. Set
-`RUN_DIR` to persistent shared storage so checkpoints survive job termination.
-
-## Repository structure
-
-```text
-caduceus/               # Caduceus/Mamba model and memory modules
-configs/                # Hydra configuration
-src/dataloaders/        # RNA datasets and data modules
-src/tasks/              # MLM loss and evaluation metrics
-slurm_scripts/          # Cluster submission scripts
-tests/fixtures/         # Small synthetic test corpus
-train.py                # Training entry point
+caduceus/memory/        BCW writer, multi-slot summarizer, bank, and reader
+caduceus/               model configuration and BiMamba integration
+configs/                Hydra model, data, pipeline, and experiment settings
+src/dataloaders/        mixed-RNA loading and MLM collation
+src/callbacks/          runtime and validation logging
+slurm_scripts/          cluster submission scripts
+tests/fixtures/         synthetic smoke-test data
+train.py                training, resume, warm-start, and metadata entry point
 ```
 
 ## Lineage
 
-This project extends the original Caduceus implementation for mixed-RNA
-pretraining and memory-augmented sequence modeling:
+The backbone is based on Caduceus:
 
 ```bibtex
 @article{schiff2024caduceus,
@@ -224,3 +266,7 @@ pretraining and memory-augmented sequence modeling:
   year={2024}
 }
 ```
+
+The cross-layer memory design is inspired by the memory-pattern perspective in
+*MemMamba: Rethinking Memory Patterns in State Space Models* and is reworked
+here for aligned bidirectional RNA states and multi-slot layer memory.

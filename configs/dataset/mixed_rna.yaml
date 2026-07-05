@@ -1,0 +1,29 @@
+_name_: rna
+dataset_name: mixed_rna
+
+bed_file: null
+fasta_file: null
+text_file: ${oc.env:RNA_TEXT_FILE}
+rna_fasta_file: ${oc.env:RNA_FASTA_FILE}
+
+tokenizer_name: char
+max_length: 1024
+max_length_val: ${.max_length}
+max_length_test: ${.max_length}
+add_eos: true
+ignore_id: 4
+
+batch_size: 16
+batch_size_eval: ${.batch_size}
+shuffle: true
+val_split_seed: 2357
+
+mlm: true
+mlm_probability: 0.15
+kmer: 1
+frame: 0
+
+rc_aug: false
+fault_tolerant: false
+ddp: false
+num_workers: 4

@@ -40,9 +40,10 @@ train:
 
   disable_dataset: False # Disable dataset loading
   validate_at_start: false
+  memory_gradient_log_interval: 100
 
   pretrained_model_path: null # Path to pretrained model
-  pretrained_model_strict_load: true # Whether to load the pretrained model even if the model is not compatible
+  pretrained_model_strict_load: true # Require an exact key and tensor-shape match
   pretrained_model_state_hook: # Hook called on the loaded model's state_dict
     _name_: null
   post_init_hook: # After initializing model, call method on model

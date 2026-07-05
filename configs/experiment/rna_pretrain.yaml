@@ -1,0 +1,75 @@
+# @package _global_
+defaults:
+  - /pipeline: rna_mlm
+  - /model: caduceus
+  - override /scheduler: cosine_warmup_timm
+
+trainer:
+  accelerator: gpu
+  devices: 8
+  num_nodes: 1
+  accumulate_grad_batches: ${div_up:${train.global_batch_size}, ${eval:${trainer.devices} * ${dataset.batch_size} * ${trainer.num_nodes}}}
+  max_epochs: null
+  max_steps: 20000
+  precision: bf16
+  gradient_clip_val: 0.5
+  num_sanity_val_steps: 0
+  val_check_interval: 100
+
+dataset:
+  batch_size: 16
+  batch_size_eval: 16
+  max_length: 1024
+  max_length_val: ${.max_length}
+  max_length_test: ${.max_length}
+
+loader:
+  num_workers: 4
+  pin_memory: true
+  drop_last: true
+
+model:
+  config:
+    d_model: 768
+    n_layer: 12
+    vocab_size: 12
+    bidirectional: true
+    bidirectional_strategy: add
+    bidirectional_weight_tie: true
+    rcps: false
+    use_memory: true
+    memory_writer_mode: bcw
+    memory_d_sum: 256
+    memory_d_mem: 128
+    memory_use_write_score: true
+    memory_num_global_slots: 1
+    memory_num_local_slots: 8
+    memory_pooling: weighted
+    memory_write_stride: 4
+    memory_read_stride: 2
+    memory_max_slots: 64
+    memory_reader_gate_init: -4.0
+    memory_share_reader: true
+    memory_persist_across_batches: false
+
+optimizer:
+  lr: 8e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.98]
+
+scheduler:
+  t_in_epochs: false
+  t_initial: 16000
+  warmup_prefix: true
+  warmup_t: 4000
+  warmup_lr_init: 1e-6
+  lr_min: 2e-5
+
+train:
+  seed: 2222
+  global_batch_size: 256
+  ckpt: checkpoints/last.ckpt
+  test: true
+  memory_gradient_log_interval: 100
+
+wandb: null
