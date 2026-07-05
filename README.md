@@ -230,18 +230,6 @@ The suite checks alignment, padding invariance, empty slots, FIFO capacity,
 read-before-write ordering, memory-specific gradients, forward isolation, and
 same-position MLM labels.
 
-## Current validation
-
-The formal 50.3M-parameter model has completed forward and backward passes on
-an RTX 4060 Laptop GPU with BF16, sequence length 1024, and batch size 8.
-Observed peak allocated memory was approximately 4.26 GiB. A two-step
-real-corpus smoke run completed training and validation without NaN, Inf, or
-OOM. These measurements validate the execution path; they are not biological
-benchmark results.
-
-True multi-GPU DDP must still be verified with the 20-step smoke job on the
-target cluster because the local machine exposes only one GPU.
-
 ## Project structure
 
 ```text
