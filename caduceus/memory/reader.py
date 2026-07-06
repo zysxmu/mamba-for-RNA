@@ -81,25 +81,48 @@ class MemoryCrossAttentionReader(nn.Module):
         k = self._split_heads(self.k_proj(normalized_memory))
         v = self._split_heads(self.v_proj(normalized_memory))
 
-        # Compute attention logits in FP32 for stable masked softmax under AMP.
-        logits = torch.matmul(q.float(), k.float().transpose(-2, -1))
-        logits = logits / math.sqrt(self.head_dim)
         key_mask = memory_mask[:, None, None, :]
-        logits = logits.masked_fill(~key_mask, torch.finfo(logits.dtype).min)
+        attention: Optional[torch.Tensor] = None
+        if return_attention:
+            # The explicit path is retained only for diagnostics that need
+            # attention probabilities.
+            logits = torch.matmul(q.float(), k.float().transpose(-2, -1))
+            logits = logits / math.sqrt(self.head_dim)
+            logits = logits.masked_fill(~key_mask, torch.finfo(logits.dtype).min)
+            safe_logits = torch.where(
+                has_memory[:, None, None, None],
+                logits,
+                torch.zeros_like(logits),
+            )
+            attention = torch.softmax(safe_logits, dim=-1)
+            attention = attention * key_mask.to(attention.dtype)
+            attention = attention * has_memory[:, None, None, None].to(attention.dtype)
+            attention = attention * query_mask[:, None, :, None].to(attention.dtype)
+            attention = F.dropout(attention, p=self.dropout, training=self.training)
+            context = torch.matmul(attention.to(v.dtype), v)
+        else:
+            # Avoid fully masked rows by exposing one zero-valued fallback
+            # slot for samples without memory. The output is masked below.
+            fallback = F.one_hot(
+                torch.zeros(
+                    memory_mask.shape[0],
+                    device=memory_mask.device,
+                    dtype=torch.long,
+                ),
+                num_classes=memory_mask.shape[1],
+            ).to(torch.bool)
+            effective_key_mask = memory_mask | (
+                (~has_memory).unsqueeze(1) & fallback
+            )
+            context = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=effective_key_mask[:, None, None, :],
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=False,
+            )
 
-        # Fully masked samples receive a zero output instead of NaN.
-        safe_logits = torch.where(
-            has_memory[:, None, None, None],
-            logits,
-            torch.zeros_like(logits),
-        )
-        attention = torch.softmax(safe_logits, dim=-1)
-        attention = attention * key_mask.to(attention.dtype)
-        attention = attention * has_memory[:, None, None, None].to(attention.dtype)
-        attention = attention * query_mask[:, None, :, None].to(attention.dtype)
-        attention = F.dropout(attention, p=self.dropout, training=self.training)
-
-        context = torch.matmul(attention.to(v.dtype), v)
         context = context.transpose(1, 2).contiguous()
         context = context.view(
             hidden_states.shape[0],
@@ -121,6 +144,7 @@ class MemoryCrossAttentionReader(nn.Module):
 
         returned_attention: Optional[torch.Tensor] = None
         if return_attention:
+            assert attention is not None
             returned_attention = attention.detach()
             probs = attention.float().clamp_min(1e-12)
             entropy = -(probs * probs.log()).sum(dim=-1)

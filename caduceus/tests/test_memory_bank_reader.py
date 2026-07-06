@@ -77,6 +77,48 @@ def test_reader_can_skip_diagnostics_without_changing_output():
     assert without_stats.stats == {}
 
 
+def test_fused_reader_matches_explicit_attention_path():
+    from caduceus.memory.reader import MemoryCrossAttentionReader
+
+    torch.manual_seed(19)
+    reader = MemoryCrossAttentionReader(
+        d_model=32,
+        d_mem=16,
+        n_heads=4,
+    ).eval()
+    hidden = torch.randn(2, 7, 32)
+    memory = torch.randn(2, 5, 16)
+    memory_mask = torch.tensor(
+        [[True, True, True, False, False], [False, False, False, False, False]]
+    )
+    query_mask = torch.tensor(
+        [[True, True, True, True, False, False, False], [True] * 7]
+    )
+
+    fused = reader(
+        hidden,
+        memory,
+        memory_mask,
+        query_mask=query_mask,
+        collect_stats=False,
+    )
+    explicit = reader(
+        hidden,
+        memory,
+        memory_mask,
+        query_mask=query_mask,
+        return_attention=True,
+        collect_stats=False,
+    )
+
+    assert torch.allclose(
+        fused.memory_output,
+        explicit.memory_output,
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
 def test_reader_masks_padding_queries():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 

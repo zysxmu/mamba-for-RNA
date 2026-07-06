@@ -65,20 +65,19 @@ class DirectionalFusion(nn.Module):
             self.norm_bwd = nn.LayerNorm(d_sum)
             relation_dim = 4 * d_sum
 
+        needs_relation_features = (
+            mode in {"scalar_gate", "bcw"} or self.use_write_score
+        )
+        if needs_relation_features:
+            self.relation_encoder = nn.Sequential(
+                nn.Linear(relation_dim, d_sum),
+                nn.GELU(),
+            )
         if mode in {"scalar_gate", "bcw"}:
             gate_dim = 1 if mode == "scalar_gate" else d_sum
-            self.direction_gate_mlp = nn.Sequential(
-                nn.Linear(relation_dim, d_sum),
-                nn.GELU(),
-                nn.Linear(d_sum, gate_dim),
-            )
-
+            self.direction_gate_head = nn.Linear(d_sum, gate_dim)
         if self.use_write_score:
-            self.write_score_mlp = nn.Sequential(
-                nn.Linear(relation_dim, d_sum),
-                nn.GELU(),
-                nn.Linear(d_sum, 1),
-            )
+            self.write_score_head = nn.Linear(d_sum, 1)
 
     def _project_directions(
         self,
@@ -120,6 +119,7 @@ class DirectionalFusion(nn.Module):
 
         valid = attention_mask.to(device=h_fwd.device, dtype=torch.bool)
         z_fwd, z_bwd = self._project_directions(h_fwd, h_bwd)
+        relation_features = None
 
         if z_bwd is None:
             relation = z_fwd
@@ -127,14 +127,23 @@ class DirectionalFusion(nn.Module):
             direction_gate = z_fwd.new_ones((*z_fwd.shape[:2], 1))
         else:
             relation = self._relation(z_fwd, z_bwd)
+            if hasattr(self, "relation_encoder"):
+                relation_features = self.relation_encoder(relation)
             if self.mode == "average":
                 direction_gate = z_fwd.new_full((*z_fwd.shape[:2], 1), 0.5)
             else:
-                direction_gate = torch.sigmoid(self.direction_gate_mlp(relation))
+                assert relation_features is not None
+                direction_gate = torch.sigmoid(
+                    self.direction_gate_head(relation_features)
+                )
             z_fused = direction_gate * z_fwd + (1.0 - direction_gate) * z_bwd
 
         if self.use_write_score:
-            write_score = torch.sigmoid(self.write_score_mlp(relation))
+            if relation_features is None:
+                relation_features = self.relation_encoder(relation)
+            write_score = torch.sigmoid(
+                self.write_score_head(relation_features)
+            )
         else:
             write_score = z_fused.new_ones((*z_fused.shape[:2], 1))
 
