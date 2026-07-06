@@ -5,10 +5,10 @@ language modeling. It uses the Caduceus BiMamba backbone and adds two
 RNA-specific components:
 
 1. **Bidirectional Consistent Writing (BCW)** aligns forward and backward
-   states at the same RNA position and learns a feature-wise directional
-   fusion.
+   states, pools them over identical RNA regions, and learns a feature-wise
+   directional fusion for each summary slot.
 2. **Cross-layer multi-slot memory** compresses the fused states into global
-   and regional slots that later layers read through gated cross-attention.
+   and regional slots that later layers read through a gated pooled reader.
 
 The implementation is intended for reproducible pretraining, ablation studies,
 and multi-GPU Slurm runs.
@@ -21,17 +21,24 @@ RNA tokens [B, L]
      -> aligned forward states  [B, L, d_model]
      -> aligned backward states [B, L, d_model]
   -> read memory written by earlier layers
-  -> BCW directional fusion     [B, L, d_sum]
-  -> global + regional pooling  [B, S, d_mem]
+  -> aligned global + regional pooling
+  -> BCW directional fusion     [B, S, d_sum]
+  -> memory compression         [B, S, d_mem]
   -> FIFO cross-layer bank      [B, M, d_mem]
-  -> later token-to-memory cross-attention
+  -> pooled memory projection and gated residual
   -> same-position MLM head
 ```
 
 Each layer reads before it writes, so a layer cannot read its own newly created
 slots. Memory exists only inside one forward pass and is never shared between
-independent RNA samples or batches. Padding is excluded from fusion statistics,
-slot pooling, and attention.
+independent RNA samples or batches. Padding is excluded from fusion statistics
+and slot pooling.
+
+The default `lightweight` implementation pools before the learned BCW
+projections and projects one bank summary per sample when reading. Its learned
+matrix operations therefore depend on the small number of slots rather than
+the sequence length. The original token-level writer and multi-head
+cross-attention reader remain available as the `full` ablation.
 
 ## Default pretraining configuration
 
@@ -42,12 +49,11 @@ The formal configuration is
 - sequence length 1024;
 - A/U/C/G/N character tokenizer;
 - 15% same-position MLM;
-- BCW with `d_sum=256`;
-- one global and eight valid-length-aware regional slots per write layer;
-- weighted pooling and `d_mem=128`;
-- write stride 4, read stride 2, and a 64-slot FIFO bank;
-- four-head shared memory reader operating in the 128-dimensional memory
-  space, with an independent gate per read layer;
+- lightweight BCW with `d_sum=64`;
+- one global and two valid-length-aware regional slots per write layer;
+- learned write importance and `d_mem=64`;
+- write stride 4, read stride 2, and a 12-slot FIFO bank;
+- one shared pooled memory reader with an independent gate per read layer;
 - FP16, AdamW, gradient clipping, and cosine decay with warmup.
 
 The reader gates start conservatively at `-4.0` before the sigmoid. This keeps
@@ -123,6 +129,7 @@ CUDA_VISIBLE_DEVICES=0,1 python -m train \
   model.config.bidirectional_strategy=add \
   model.config.bidirectional_weight_tie=true \
   model.config.rcps=false \
+  model.config.memory_implementation=lightweight \
   optimizer.lr=8e-5 \
   optimizer.weight_decay=0.01 \
   'optimizer.betas=[0.9,0.98]' \
@@ -183,9 +190,18 @@ python -m train experiment=rna_pretrain \
 python -m train experiment=rna_pretrain \
   model.config.memory_writer_mode=average
 
-# Full BCW + multi-slot memory (formal default)
+# Lightweight BCW + pooled cross-layer memory (training default)
 python -m train experiment=rna_pretrain \
+  model.config.memory_implementation=lightweight \
   model.config.memory_writer_mode=bcw
+
+# Token-level BCW + multi-head cross-attention (expensive ablation)
+python -m train experiment=rna_pretrain \
+  model.config.memory_implementation=full \
+  model.config.memory_d_sum=256 \
+  model.config.memory_d_mem=128 \
+  model.config.memory_num_local_slots=8 \
+  model.config.memory_max_slots=64
 
 # One global slot only
 python -m train experiment=rna_pretrain \
@@ -198,8 +214,8 @@ python -m train experiment=rna_pretrain \
   model.config.memory_use_write_score=false
 ```
 
-`scalar_gate`, `max` pooling, source-embedding switches, reader sharing, and
-read/write strides are also configurable in
+`scalar_gate`, source-embedding switches, reader sharing, and read/write
+strides are also configurable in
 [`configs/model/caduceus.yaml`](configs/model/caduceus.yaml).
 
 BCW is the writer used by the memory path; a nominal "BCW-only" setting with no

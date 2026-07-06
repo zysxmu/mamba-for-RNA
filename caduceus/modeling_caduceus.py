@@ -28,6 +28,10 @@ except ImportError:
 
 from .configuration_caduceus import CaduceusConfig
 from .memory.bank import CrossLayerMemoryBank
+from .memory.lightweight import (
+    LightweightBidirectionalConsistentMemoryWriter,
+    PooledMemoryReader,
+)
 from .memory.reader import MemoryCrossAttentionReader
 from .memory.writer import BidirectionalConsistentMemoryWriter
 from .modeling_rcps import RCPSAddNormWrapper, RCPSEmbedding, RCPSLMHead, RCPSMambaBlock
@@ -265,7 +269,12 @@ class CaduceusMixerModel(nn.Module):
         hidden_dim = config.d_model * (2 if config.rcps else 1)
 
         if self.use_memory:
-            self.memory_writer = BidirectionalConsistentMemoryWriter(
+            writer_cls = (
+                LightweightBidirectionalConsistentMemoryWriter
+                if config.memory_implementation == "lightweight"
+                else BidirectionalConsistentMemoryWriter
+            )
+            self.memory_writer = writer_cls(
                 d_model=hidden_dim,
                 d_sum=config.memory_d_sum,
                 d_mem=config.memory_d_mem,
@@ -287,14 +296,22 @@ class CaduceusMixerModel(nn.Module):
             self.memory_replacement = config.memory_replacement
             self.memory_share_reader = config.memory_share_reader
 
-            reader_kwargs = {
-                "d_model": hidden_dim,
-                "d_mem": config.memory_d_mem,
-                "n_heads": config.memory_n_heads,
-                "dropout": config.memory_attn_dropout,
-            }
+            if config.memory_implementation == "lightweight":
+                reader_cls = PooledMemoryReader
+                reader_kwargs = {
+                    "d_model": hidden_dim,
+                    "d_mem": config.memory_d_mem,
+                }
+            else:
+                reader_cls = MemoryCrossAttentionReader
+                reader_kwargs = {
+                    "d_model": hidden_dim,
+                    "d_mem": config.memory_d_mem,
+                    "n_heads": config.memory_n_heads,
+                    "dropout": config.memory_attn_dropout,
+                }
             if self.memory_share_reader:
-                self.memory_attn = MemoryCrossAttentionReader(**reader_kwargs)
+                self.memory_attn = reader_cls(**reader_kwargs)
             else:
                 read_layers = [
                     i
@@ -303,7 +320,7 @@ class CaduceusMixerModel(nn.Module):
                 ]
                 self.memory_readers = nn.ModuleDict(
                     {
-                        str(layer_idx): MemoryCrossAttentionReader(**reader_kwargs)
+                        str(layer_idx): reader_cls(**reader_kwargs)
                         for layer_idx in read_layers
                     }
                 )
@@ -317,7 +334,7 @@ class CaduceusMixerModel(nn.Module):
                 )
             )
 
-    def _memory_reader(self, layer_idx: int) -> MemoryCrossAttentionReader:
+    def _memory_reader(self, layer_idx: int) -> nn.Module:
         if self.memory_share_reader:
             return self.memory_attn
         return self.memory_readers[str(layer_idx)]

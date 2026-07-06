@@ -38,16 +38,17 @@ model:
     bidirectional_weight_tie: true
     rcps: false
     use_memory: true
+    memory_implementation: lightweight
     memory_writer_mode: bcw
-    memory_d_sum: 256
-    memory_d_mem: 128
+    memory_d_sum: 64
+    memory_d_mem: 64
     memory_use_write_score: true
     memory_num_global_slots: 1
-    memory_num_local_slots: 8
+    memory_num_local_slots: 2
     memory_pooling: weighted
     memory_write_stride: 4
     memory_read_stride: 2
-    memory_max_slots: 64
+    memory_max_slots: 12
     memory_reader_gate_init: -4.0
     memory_share_reader: true
     memory_persist_across_batches: false

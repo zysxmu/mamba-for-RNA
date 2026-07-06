@@ -38,6 +38,7 @@ class CaduceusConfig(PretrainedConfig):
 
             # RNA cross-layer memory
             use_memory: bool = False,
+            memory_implementation: str = "full",
             memory_writer_mode: str = "bcw",
             memory_share_direction_projection: bool = True,
             memory_single_direction: str = "fwd",
@@ -87,6 +88,10 @@ class CaduceusConfig(PretrainedConfig):
 
         if memory_writer_mode not in {"single", "average", "scalar_gate", "bcw"}:
             raise ValueError(f"Unsupported memory_writer_mode: {memory_writer_mode}")
+        if memory_implementation not in {"lightweight", "full"}:
+            raise ValueError(
+                "memory_implementation must be 'lightweight' or 'full'"
+            )
         if memory_single_direction not in {"fwd", "bwd"}:
             raise ValueError("memory_single_direction must be 'fwd' or 'bwd'")
         if memory_pooling not in {"mean", "max", "weighted"}:
@@ -113,10 +118,11 @@ class CaduceusConfig(PretrainedConfig):
             raise ValueError("memory_max_slots must be positive")
         if memory_replacement != "fifo":
             raise ValueError("Only FIFO memory replacement is currently supported")
-        if memory_d_mem % memory_n_heads != 0:
+        if memory_implementation == "full" and memory_d_mem % memory_n_heads != 0:
             raise ValueError("memory_d_mem must be divisible by memory_n_heads")
 
         self.use_memory = use_memory
+        self.memory_implementation = memory_implementation
         self.memory_writer_mode = memory_writer_mode
         self.memory_share_direction_projection = memory_share_direction_projection
         self.memory_single_direction = memory_single_direction
