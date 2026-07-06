@@ -21,22 +21,23 @@ class MemoryCrossAttentionReader(nn.Module):
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
-        if d_model % n_heads != 0:
-            raise ValueError("d_model must be divisible by memory_n_heads")
         if not 0.0 <= dropout < 1.0:
             raise ValueError("memory attention dropout must be in [0, 1)")
 
         self.d_model = int(d_model)
         self.n_heads = int(n_heads)
-        self.head_dim = self.d_model // self.n_heads
         self.dropout = float(dropout)
 
         self.query_norm = nn.LayerNorm(d_model)
         self.memory_norm = nn.LayerNorm(d_mem)
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_mem, d_model)
-        self.v_proj = nn.Linear(d_mem, d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
+        self.attention_dim = int(d_mem)
+        if self.attention_dim % self.n_heads != 0:
+            raise ValueError("d_mem must be divisible by memory_n_heads")
+        self.head_dim = self.attention_dim // self.n_heads
+        self.q_proj = nn.Linear(d_model, self.attention_dim)
+        self.k_proj = nn.Linear(d_mem, self.attention_dim)
+        self.v_proj = nn.Linear(d_mem, self.attention_dim)
+        self.out_proj = nn.Linear(self.attention_dim, d_model)
 
     def _split_heads(self, tensor: torch.Tensor) -> torch.Tensor:
         batch, length, _ = tensor.shape
@@ -49,6 +50,7 @@ class MemoryCrossAttentionReader(nn.Module):
         memory_mask: torch.Tensor,
         query_mask: Optional[torch.Tensor] = None,
         return_attention: bool = False,
+        collect_stats: bool = True,
     ) -> MemoryReaderOutput:
         if hidden_states.ndim != 3 or memory_bank.ndim != 3:
             raise ValueError("hidden_states and memory_bank must be rank-3 tensors")
@@ -99,19 +101,23 @@ class MemoryCrossAttentionReader(nn.Module):
 
         context = torch.matmul(attention.to(v.dtype), v)
         context = context.transpose(1, 2).contiguous()
-        context = context.view(hidden_states.shape[0], hidden_states.shape[1], self.d_model)
+        context = context.view(
+            hidden_states.shape[0],
+            hidden_states.shape[1],
+            self.attention_dim,
+        )
         memory_output = self.out_proj(context)
         memory_output = memory_output * valid_queries.unsqueeze(-1).to(memory_output.dtype)
 
-        valid_outputs = memory_output[valid_queries]
-        output_norm = (
-            valid_outputs.float().norm(dim=-1).mean()
-            if valid_outputs.numel()
-            else memory_output.new_zeros((), dtype=torch.float)
-        )
-        stats = {
-            "memory_output_norm": output_norm.detach().to(memory_output.dtype),
-        }
+        stats = {}
+        if collect_stats:
+            valid_outputs = memory_output[valid_queries]
+            output_norm = (
+                valid_outputs.float().norm(dim=-1).mean()
+                if valid_outputs.numel()
+                else memory_output.new_zeros((), dtype=torch.float)
+            )
+            stats["memory_output_norm"] = output_norm.detach().to(memory_output.dtype)
 
         returned_attention: Optional[torch.Tensor] = None
         if return_attention:

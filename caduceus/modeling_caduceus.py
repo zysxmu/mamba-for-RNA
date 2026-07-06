@@ -430,16 +430,22 @@ class CaduceusMixerModel(nn.Module):
                         memory_mask=memory_mask,
                         query_mask=attention_mask,
                         return_attention=return_memory_attention,
+                        collect_stats=collect_memory_stats,
                     )
                     alpha = torch.sigmoid(self.memory_read_gates[i]).to(hidden_states.dtype)
                     memory_residual = alpha * reader_output.memory_output
-                    hidden_norm = hidden_states.detach().float().norm().clamp_min(1e-12)
-                    memory_ratio = memory_residual.detach().float().norm() / hidden_norm
+                    if collect_memory_stats:
+                        hidden_norm = (
+                            hidden_states.detach().float().norm().clamp_min(1e-12)
+                        )
                     hidden_states = hidden_states + memory_residual
 
                     if return_memory_attention:
                         self.last_memory_attention = reader_output.attention_weights
                     if collect_memory_stats:
+                        memory_ratio = (
+                            memory_residual.detach().float().norm() / hidden_norm
+                        )
                         self._append_stats(raw_memory_stats, reader_output.stats)
                         raw_memory_stats.setdefault("memory_hidden_ratio", []).append(
                             memory_ratio.detach()
@@ -465,6 +471,7 @@ class CaduceusMixerModel(nn.Module):
                         h_bwd=bim.last_bwd,
                         attention_mask=attention_mask,
                         layer_idx=i,
+                        collect_stats=collect_memory_stats,
                     )
                     memory_bank.append(
                         writer_output.memory_slots,

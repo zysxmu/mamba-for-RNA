@@ -58,7 +58,7 @@ class CaduceusConfig(PretrainedConfig):
             memory_read_stride: int = 2,
             memory_max_slots: int = 64,
             memory_replacement: str = "fifo",
-            memory_collect_stats: bool = True,
+            memory_collect_stats: bool = False,
             memory_persist_across_batches: bool = False,
             memory_max_size: Optional[int] = None,
 
@@ -113,8 +113,8 @@ class CaduceusConfig(PretrainedConfig):
             raise ValueError("memory_max_slots must be positive")
         if memory_replacement != "fifo":
             raise ValueError("Only FIFO memory replacement is currently supported")
-        if d_model % memory_n_heads != 0:
-            raise ValueError("d_model must be divisible by memory_n_heads")
+        if memory_d_mem % memory_n_heads != 0:
+            raise ValueError("memory_d_mem must be divisible by memory_n_heads")
 
         self.use_memory = use_memory
         self.memory_writer_mode = memory_writer_mode

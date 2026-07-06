@@ -46,8 +46,9 @@ The formal configuration is
 - one global and eight valid-length-aware regional slots per write layer;
 - weighted pooling and `d_mem=128`;
 - write stride 4, read stride 2, and a 64-slot FIFO bank;
-- four-head shared memory reader with an independent gate per read layer;
-- BF16, AdamW, gradient clipping, and cosine decay with warmup.
+- four-head shared memory reader operating in the 128-dimensional memory
+  space, with an independent gate per read layer;
+- FP16, AdamW, gradient clipping, and cosine decay with warmup.
 
 The reader gates start conservatively at `-4.0` before the sigmoid. This keeps
 the pretrained backbone path dominant at initialization while still allowing
@@ -91,6 +92,61 @@ source .venv/bin/activate
 
 `requirements-core.txt` contains the dependencies used by the RNA pretraining
 path. `requirements.txt` retains the original full environment export.
+
+## Epoch-based pretraining
+
+The original epoch-based training entry point is retained. BCW and cross-layer
+memory are selected by `model=caduceus`; they do not replace the optimizer,
+dataset, scheduler, validation, or checkpoint workflow.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python -m train \
+  experiment=hg38/hg38 \
+  trainer.devices=2 \
+  trainer.accelerator=gpu \
+  dataset.dataset_name=mixed_rna \
+  +dataset.text_file=/absolute/path/data-random_15K_sequences.txt \
+  +dataset.rna_fasta_file=/absolute/path/rnacentral_small_ATCG_only.fasta \
+  dataset.tokenizer_name=char \
+  +dataset.kmer=1 \
+  +dataset.frame=0 \
+  dataset.max_length=1024 \
+  dataset.batch_size=16 \
+  dataset.batch_size_eval=64 \
+  dataset.mlm=true \
+  dataset.mlm_probability=0.15 \
+  model=caduceus \
+  model.config.d_model=768 \
+  model.config.n_layer=12 \
+  model.config.vocab_size=12 \
+  model.config.bidirectional=true \
+  model.config.bidirectional_strategy=add \
+  model.config.bidirectional_weight_tie=true \
+  model.config.rcps=false \
+  optimizer.lr=8e-5 \
+  optimizer.weight_decay=0.01 \
+  'optimizer.betas=[0.9,0.98]' \
+  trainer.precision=16 \
+  trainer.gradient_clip_val=0.5 \
+  trainer.max_epochs=50 \
+  trainer.max_steps=20000 \
+  trainer.limit_val_batches=1.0 \
+  +trainer.val_check_interval=100 \
+  trainer.num_sanity_val_steps=0 \
+  scheduler._name_=cosine_warmup_timm \
+  scheduler.t_initial=30000 \
+  scheduler.warmup_t=4000 \
+  scheduler.lr_min=2e-5 \
+  scheduler.warmup_lr_init=1e-6 \
+  wandb=null \
+  train.monitor=val/loss \
+  train.mode=min \
+  callbacks.model_checkpoint.monitor=val/loss \
+  callbacks.model_checkpoint.mode=min \
+  callbacks.model_checkpoint.dirpath=./checkpoints_best \
+  callbacks.model_checkpoint.filename=val/loss \
+  callbacks.periodic_checkpoint.dirpath=./checkpoints_periodic
+```
 
 ## Local smoke test
 

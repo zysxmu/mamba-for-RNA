@@ -9,9 +9,9 @@ trainer:
   devices: 8
   num_nodes: 1
   accumulate_grad_batches: ${div_up:${train.global_batch_size}, ${eval:${trainer.devices} * ${dataset.batch_size} * ${trainer.num_nodes}}}
-  max_epochs: null
+  max_epochs: 50
   max_steps: 20000
-  precision: bf16
+  precision: 16
   gradient_clip_val: 0.5
   num_sanity_val_steps: 0
   val_check_interval: 100

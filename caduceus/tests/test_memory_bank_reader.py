@@ -40,6 +40,8 @@ def test_reader_masks_empty_slots_and_tokens_can_select_different_memory():
     )
 
     output = reader(hidden, memory, mask, return_attention=True)
+    assert reader.q_proj.out_features == 16
+    assert reader.out_proj.in_features == 16
     assert output.memory_output.shape == hidden.shape
     assert output.attention_weights.shape == (2, 4, 5, 4)
     assert torch.isfinite(output.memory_output).all()
@@ -52,6 +54,27 @@ def test_reader_masks_empty_slots_and_tokens_can_select_different_memory():
         output.attention_weights[0, :, 0],
         output.attention_weights[0, :, 1],
     )
+
+
+def test_reader_can_skip_diagnostics_without_changing_output():
+    from caduceus.memory.reader import MemoryCrossAttentionReader
+
+    torch.manual_seed(13)
+    reader = MemoryCrossAttentionReader(
+        d_model=32,
+        d_mem=16,
+        n_heads=4,
+    ).eval()
+    hidden = torch.randn(2, 5, 32)
+    memory = torch.randn(2, 3, 16)
+    mask = torch.ones(2, 3, dtype=torch.bool)
+
+    with_stats = reader(hidden, memory, mask, collect_stats=True)
+    without_stats = reader(hidden, memory, mask, collect_stats=False)
+
+    assert torch.equal(with_stats.memory_output, without_stats.memory_output)
+    assert "memory_output_norm" in with_stats.stats
+    assert without_stats.stats == {}
 
 
 def test_reader_masks_padding_queries():

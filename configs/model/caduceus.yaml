@@ -57,10 +57,10 @@ config:
   memory_reader_gate_init: -4.0
   memory_share_reader: true
   memory_write_stride: 4
-  memory_read_stride: 1
+  memory_read_stride: 2
   memory_max_slots: 64
   memory_replacement: "fifo"
-  memory_collect_stats: true
+  memory_collect_stats: false
   memory_persist_across_batches: false
   pad_token_id: 4
 

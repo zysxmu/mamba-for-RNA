@@ -44,6 +44,34 @@ def test_writer_shape_and_stats():
     }.issubset(output.stats)
 
 
+def test_writer_can_skip_diagnostics_without_changing_slots():
+    torch.manual_seed(11)
+    writer = _make_writer()
+    h_fwd = torch.randn(2, 16, 32)
+    h_bwd = torch.randn(2, 16, 32)
+    attention_mask = torch.ones(2, 16, dtype=torch.bool)
+
+    with_stats = writer(
+        h_fwd,
+        h_bwd,
+        attention_mask,
+        layer_idx=1,
+        collect_stats=True,
+    )
+    without_stats = writer(
+        h_fwd,
+        h_bwd,
+        attention_mask,
+        layer_idx=1,
+        collect_stats=False,
+    )
+
+    assert torch.equal(with_stats.memory_slots, without_stats.memory_slots)
+    assert torch.equal(with_stats.slot_mask, without_stats.slot_mask)
+    assert with_stats.stats
+    assert without_stats.stats == {}
+
+
 def test_writer_padding_invariance_and_empty_safety():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(1)

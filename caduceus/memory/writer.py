@@ -109,6 +109,7 @@ class DirectionalFusion(nn.Module):
         h_fwd: torch.Tensor,
         h_bwd: torch.Tensor,
         attention_mask: torch.Tensor,
+        collect_stats: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         if h_fwd.shape != h_bwd.shape:
             raise ValueError("Forward and backward states must have identical shapes")
@@ -122,10 +123,8 @@ class DirectionalFusion(nn.Module):
             relation = z_fwd
             z_fused = z_fwd
             direction_gate = z_fwd.new_ones((*z_fwd.shape[:2], 1))
-            cosine = z_fwd.new_ones(z_fwd.shape[:2])
         else:
             relation = self._relation(z_fwd, z_bwd)
-            cosine = F.cosine_similarity(z_fwd.float(), z_bwd.float(), dim=-1).to(z_fwd.dtype)
             if self.mode == "average":
                 direction_gate = z_fwd.new_full((*z_fwd.shape[:2], 1), 0.5)
             else:
@@ -141,14 +140,25 @@ class DirectionalFusion(nn.Module):
         z_fused = z_fused * valid_f
         write_score = write_score * valid_f
 
-        gate_mask = valid.unsqueeze(-1).expand_as(direction_gate)
-        stats = {
-            "direction_gate_mean": _masked_mean(direction_gate, gate_mask).detach(),
-            "direction_gate_std": _masked_std(direction_gate, gate_mask).detach(),
-            "write_score_mean": _masked_mean(write_score, valid.unsqueeze(-1)).detach(),
-            "write_score_std": _masked_std(write_score, valid.unsqueeze(-1)).detach(),
-            "fwd_bwd_cosine": _masked_mean(cosine, valid).detach(),
-        }
+        stats = {}
+        if collect_stats:
+            cosine = (
+                z_fwd.new_ones(z_fwd.shape[:2])
+                if z_bwd is None
+                else F.cosine_similarity(
+                    z_fwd.float(),
+                    z_bwd.float(),
+                    dim=-1,
+                ).to(z_fwd.dtype)
+            )
+            gate_mask = valid.unsqueeze(-1).expand_as(direction_gate)
+            stats = {
+                "direction_gate_mean": _masked_mean(direction_gate, gate_mask).detach(),
+                "direction_gate_std": _masked_std(direction_gate, gate_mask).detach(),
+                "write_score_mean": _masked_mean(write_score, valid.unsqueeze(-1)).detach(),
+                "write_score_std": _masked_std(write_score, valid.unsqueeze(-1)).detach(),
+                "fwd_bwd_cosine": _masked_mean(cosine, valid).detach(),
+            }
         return z_fused, write_score, stats
 
 
@@ -255,6 +265,7 @@ class MultiSlotMemorySummarizer(nn.Module):
         write_score: torch.Tensor,
         attention_mask: torch.Tensor,
         layer_idx: int,
+        collect_stats: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         valid = attention_mask.to(device=z_fused.device, dtype=torch.bool)
         summaries = []
@@ -302,20 +313,24 @@ class MultiSlotMemorySummarizer(nn.Module):
         memory_slots = self.memory_norm(memory_slots)
         memory_slots = memory_slots * slot_mask.unsqueeze(-1).to(memory_slots.dtype)
 
-        global_mask = (
-            slot_mask[:, :1] if self.num_global_slots else slot_mask[:, :0]
-        )
-        local_mask = slot_mask[:, self.num_global_slots :]
-        stats = {
-            "num_memory_slots_written": memory_slots.new_tensor(memory_slots.shape[1]).detach(),
-            "num_valid_slots_written": slot_mask.float().sum(dim=1).mean().detach(),
-            "global_slot_norm": self._slot_norm(
-                memory_slots[:, : self.num_global_slots], global_mask
-            ).detach(),
-            "local_slot_norm": self._slot_norm(
-                memory_slots[:, self.num_global_slots :], local_mask
-            ).detach(),
-        }
+        stats = {}
+        if collect_stats:
+            global_mask = (
+                slot_mask[:, :1] if self.num_global_slots else slot_mask[:, :0]
+            )
+            local_mask = slot_mask[:, self.num_global_slots :]
+            stats = {
+                "num_memory_slots_written": memory_slots.new_tensor(
+                    memory_slots.shape[1]
+                ).detach(),
+                "num_valid_slots_written": slot_mask.float().sum(dim=1).mean().detach(),
+                "global_slot_norm": self._slot_norm(
+                    memory_slots[:, : self.num_global_slots], global_mask
+                ).detach(),
+                "local_slot_norm": self._slot_norm(
+                    memory_slots[:, self.num_global_slots :], local_mask
+                ).detach(),
+            }
         return memory_slots, slot_mask, stats
 
     @staticmethod
@@ -374,6 +389,7 @@ class BidirectionalConsistentMemoryWriter(nn.Module):
         h_bwd: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         layer_idx: int = 0,
+        collect_stats: bool = True,
     ) -> MemoryWriterOutput:
         if attention_mask is None:
             attention_mask = torch.ones(
@@ -385,12 +401,14 @@ class BidirectionalConsistentMemoryWriter(nn.Module):
             h_fwd,
             h_bwd,
             attention_mask,
+            collect_stats=collect_stats,
         )
         memory_slots, slot_mask, slot_stats = self.summarizer(
             z_fused,
             write_score,
             attention_mask,
             layer_idx,
+            collect_stats=collect_stats,
         )
         return MemoryWriterOutput(
             memory_slots=memory_slots,
