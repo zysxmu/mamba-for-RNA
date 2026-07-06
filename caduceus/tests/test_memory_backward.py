@@ -29,12 +29,16 @@ def test_memory_backward():
     loss = out.float().pow(2).mean()
     loss.backward()
 
-    found_grad = False
-    for name, p in model.named_parameters():
-        if p.grad is not None:
-            found_grad = True
-            assert not torch.isnan(p.grad).any(), f"NaN grad in {name}"
-            break
+    memory_parameters = {
+        name: parameter
+        for name, parameter in model.named_parameters()
+        if "memory_writer" in name or "memory_attn" in name
+    }
+    assert memory_parameters
+    for name, parameter in memory_parameters.items():
+        assert parameter.grad is not None, f"No gradient for {name}"
+        assert torch.isfinite(parameter.grad).all(), f"Invalid gradient in {name}"
 
-    assert found_grad, "No gradients found anywhere"
-    print("loss:", float(loss.item()))
+    assert sum(
+        parameter.grad.abs().sum() for parameter in memory_parameters.values()
+    ) > 0
