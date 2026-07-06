@@ -72,6 +72,40 @@ def test_writer_can_skip_diagnostics_without_changing_slots():
     assert without_stats.stats == {}
 
 
+def test_vectorized_regional_pool_matches_slotwise_reference():
+    torch.manual_seed(17)
+    summarizer = _make_writer().summarizer
+    values = torch.randn(3, 19, 16)
+    write_score = torch.sigmoid(torch.randn(3, 19, 1))
+    valid = torch.zeros(3, 19, dtype=torch.bool)
+    valid[0, :19] = True
+    valid[1, :13] = True
+    valid[2, :7] = True
+    region_ids = summarizer._regional_ids(valid)
+
+    vectorized, vectorized_mask = summarizer._pool_regions(
+        values,
+        valid,
+        write_score,
+        region_ids,
+    )
+    reference = []
+    reference_mask = []
+    for slot_idx in range(summarizer.num_local_slots):
+        summary, slot_valid = summarizer._pool(
+            values,
+            valid & region_ids.eq(slot_idx),
+            write_score,
+        )
+        reference.append(summary)
+        reference_mask.append(slot_valid)
+
+    reference = torch.stack(reference, dim=1)
+    reference_mask = torch.stack(reference_mask, dim=1)
+    assert torch.equal(vectorized_mask, reference_mask)
+    assert torch.allclose(vectorized, reference, atol=1e-5, rtol=1e-5)
+
+
 def test_writer_padding_invariance_and_empty_safety():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(1)

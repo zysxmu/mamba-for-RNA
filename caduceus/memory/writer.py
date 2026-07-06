@@ -90,8 +90,10 @@ class DirectionalFusion(nn.Module):
             return self.single_norm(self.single_projection(source)), None
 
         if self.share_projection:
-            z_fwd = self.shared_norm(self.shared_projection(h_fwd))
-            z_bwd = self.shared_norm(self.shared_projection(h_bwd))
+            projected = self.shared_norm(
+                self.shared_projection(torch.cat((h_fwd, h_bwd), dim=0))
+            )
+            z_fwd, z_bwd = projected.chunk(2, dim=0)
         else:
             z_fwd = self.norm_fwd(self.proj_fwd(h_fwd))
             z_bwd = self.norm_bwd(self.proj_bwd(h_bwd))
@@ -259,6 +261,47 @@ class MultiSlotMemorySummarizer(nn.Module):
         ).clamp(max=max(0, self.num_local_slots - 1))
         return region_ids.masked_fill(~valid, -1)
 
+    def _pool_regions(
+        self,
+        values: torch.Tensor,
+        valid: torch.Tensor,
+        write_score: torch.Tensor,
+        region_ids: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Pool all non-overlapping regions in one scatter pass."""
+        batch, _, width = values.shape
+        safe_ids = region_ids.clamp_min(0)
+        region_valid = valid & region_ids.ge(0)
+
+        if self.pooling == "weighted":
+            weights = write_score.squeeze(-1) * region_valid.to(write_score.dtype)
+        else:
+            weights = region_valid.to(values.dtype)
+
+        weights_fp32 = weights.float()
+        denominator = values.new_zeros(
+            (batch, self.num_local_slots),
+            dtype=torch.float,
+        )
+        denominator.scatter_add_(1, safe_ids, weights_fp32)
+
+        numerator = values.new_zeros(
+            (batch, self.num_local_slots, width),
+            dtype=torch.float,
+        )
+        expanded_ids = safe_ids.unsqueeze(-1).expand(-1, -1, width)
+        numerator.scatter_add_(
+            1,
+            expanded_ids,
+            values.float() * weights_fp32.unsqueeze(-1),
+        )
+
+        slot_valid = denominator.gt(0)
+        summaries = numerator / denominator.clamp_min(1e-6).unsqueeze(-1)
+        summaries = summaries.to(values.dtype)
+        summaries = summaries * slot_valid.unsqueeze(-1).to(summaries.dtype)
+        return summaries, slot_valid
+
     def forward(
         self,
         z_fused: torch.Tensor,
@@ -282,13 +325,29 @@ class MultiSlotMemorySummarizer(nn.Module):
 
         if self.num_local_slots:
             region_ids = self._regional_ids(valid)
-            for slot_idx in range(self.num_local_slots):
-                region_valid = valid & region_ids.eq(slot_idx)
-                summary, slot_valid = self._pool(z_fused, region_valid, write_score)
-                summaries.append(summary)
-                masks.append(slot_valid)
-                slot_types.append(1)
-                local_positions.append(slot_idx)
+            if self.pooling in {"mean", "weighted"}:
+                regional_summaries, regional_masks = self._pool_regions(
+                    z_fused,
+                    valid,
+                    write_score,
+                    region_ids,
+                )
+                summaries.extend(regional_summaries.unbind(dim=1))
+                masks.extend(regional_masks.unbind(dim=1))
+                slot_types.extend([1] * self.num_local_slots)
+                local_positions.extend(range(self.num_local_slots))
+            else:
+                for slot_idx in range(self.num_local_slots):
+                    region_valid = valid & region_ids.eq(slot_idx)
+                    summary, slot_valid = self._pool(
+                        z_fused,
+                        region_valid,
+                        write_score,
+                    )
+                    summaries.append(summary)
+                    masks.append(slot_valid)
+                    slot_types.append(1)
+                    local_positions.append(slot_idx)
 
         slot_summaries = torch.stack(summaries, dim=1)  # [B, S, d_sum]
         slot_mask = torch.stack(masks, dim=1)  # [B, S]
