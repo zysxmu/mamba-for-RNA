@@ -58,3 +58,4 @@ class MemoryPool(nn.Module):
                 return None
 
         return torch.cat(self.memory, dim=1)
+

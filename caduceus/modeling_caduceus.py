@@ -188,9 +188,9 @@ class CaduceusEmbeddings(nn.Module):
 
 
 class MemoryWriterWrapper(nn.Module):
-
-    def __init__(self, d_model: int, d_sum: int = 64, d_mem: int = 64,
-                 pool: str = "mean", gate: str = "vector"):
+   
+    def __init__(self, d_model: int, d_sum: int = 256, d_mem: int = 128,
+                 pool: str = "mean", gate: str = "scalar"):
         super().__init__()
         self.writer = BidirectionalMemoryWriter(
             d_model=d_model, d_sum=d_sum, d_mem=d_mem, pool=pool, gate=gate
@@ -267,7 +267,7 @@ class CaduceusMixerModel(nn.Module):
                 d_sum=config.memory_d_sum,
                 d_mem=config.memory_d_mem,
                 pool="mean",
-                gate="vector",
+                gate="scalar",
             )
             self.memory_pool = MemoryPool(max_size=config.memory_max_size)
             self.memory_attn = MemoryCrossAttention(

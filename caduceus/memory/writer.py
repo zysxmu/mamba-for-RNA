@@ -1,63 +1,74 @@
-"""Lightweight bidirectional-consistent memory writing."""
-
 import torch
-from torch import nn
+import torch.nn as nn
+import torch.nn.functional as F
 
 
 class BidirectionalMemoryWriter(nn.Module):
-    """Fuse aligned forward/backward summaries into one memory entry.
-
-    Pooling happens before learned projections, so the expensive learned
-    operations are independent of the RNA sequence length.
+    """
+    从 (h_fwd, h_bwd) 生成对齐的 memory entry：
+      s_fwd = summarize(h_fwd)
+      s_bwd = summarize(h_bwd)
+      s = gate(s_fwd, s_bwd)
+      entry = compress(s)
     """
 
     def __init__(
         self,
         d_model: int,
-        d_sum: int = 64,
-        d_mem: int = 64,
-        pool: str = "mean",
-        gate: str = "vector",
+        d_sum: int = 256,      
+        d_mem: int = 128,     
+        pool: str = "mean",   
+        gate: str = "scalar", 
     ):
         super().__init__()
-        if pool not in {"mean", "last", "cls"}:
-            raise ValueError(f"Unknown pool: {pool}")
-        if gate not in {"scalar", "vector"}:
-            raise ValueError(f"Unknown gate: {gate}")
-
         self.pool = pool
         self.gate = gate
-        self.shared_projection = nn.Linear(d_model, d_sum)
-        self.shared_norm = nn.LayerNorm(d_sum)
 
-        gate_dim = 1 if gate == "scalar" else d_sum
-        self.gate_mlp = nn.Sequential(
-            nn.Linear(4 * d_sum, d_sum),
-            nn.GELU(),
-            nn.Linear(d_sum, gate_dim),
-        )
+        # summarize：把 token-level hidden -> summary 向量
+        self.proj_fwd = nn.Linear(d_model, d_sum)
+        self.proj_bwd = nn.Linear(d_model, d_sum)
+
+        # gate：融合 fwd/bwd
+        if gate == "scalar":
+            self.gate_mlp = nn.Sequential(
+                nn.Linear(2 * d_sum, d_sum),
+                nn.GELU(),
+                nn.Linear(d_sum, 1),
+            )
+        elif gate == "vector":
+            self.gate_mlp = nn.Sequential(
+                nn.Linear(2 * d_sum, d_sum),
+                nn.GELU(),
+                nn.Linear(d_sum, d_sum),
+            )
+        else:
+            raise ValueError(f"Unknown gate: {gate}")
+
+        # compress：把 summary 压缩成 memory entry
         self.compress = nn.Sequential(
             nn.Linear(d_sum, d_sum),
             nn.GELU(),
             nn.Linear(d_sum, d_mem),
         )
+
+        # 可选：归一化让相似度检索更稳
         self.norm = nn.LayerNorm(d_mem)
 
-    def _pool(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None,
-    ) -> torch.Tensor:
+    def _pool(self, h: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        h: [B, L, D]
+        attn_mask: [B, L] (1=valid, 0=pad) 可选
+        """
         if self.pool == "mean":
-            if attention_mask is None:
-                return hidden_states.mean(dim=1)
-            weights = attention_mask.to(hidden_states.dtype).unsqueeze(-1)
-            numerator = (hidden_states * weights).sum(dim=1)
-            denominator = weights.sum(dim=1).clamp_min(1.0)
-            return numerator / denominator
+            if attn_mask is None:
+                return h.mean(dim=1)
+            w = attn_mask.float().unsqueeze(-1)  # [B, L, 1]
+            return (h * w).sum(dim=1) / (w.sum(dim=1).clamp_min(1.0))
         if self.pool == "last":
-            return hidden_states[:, -1]
-        return hidden_states[:, 0]
+            return h[:, -1, :]
+        if self.pool == "cls":
+            return h[:, 0, :]
+        raise ValueError(f"Unknown pool: {self.pool}")
 
     def forward(
         self,
@@ -65,29 +76,28 @@ class BidirectionalMemoryWriter(nn.Module):
         h_bwd: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
     ):
-        if h_fwd.shape != h_bwd.shape:
-            raise ValueError("Forward and backward states must have identical shapes")
-        if attn_mask is not None and attn_mask.shape != h_fwd.shape[:2]:
-            raise ValueError("attn_mask must have shape [B, L]")
+        """
+        h_fwd/h_bwd: [B, L, D]
+        """
+        p_fwd = self._pool(h_fwd, attn_mask)  # [B, D]
+        p_bwd = self._pool(h_bwd, attn_mask)  # [B, D]
 
-        pooled_fwd = self._pool(h_fwd, attn_mask)
-        pooled_bwd = self._pool(h_bwd, attn_mask)
-        projected = self.shared_norm(
-            self.shared_projection(torch.cat((pooled_fwd, pooled_bwd), dim=0))
-        )
-        z_fwd, z_bwd = projected.chunk(2, dim=0)
+        s_fwd = self.proj_fwd(p_fwd)          # [B, d_sum]
+        s_bwd = self.proj_bwd(p_bwd)          # [B, d_sum]
 
-        relation = torch.cat(
-            (z_fwd, z_bwd, torch.abs(z_fwd - z_bwd), z_fwd * z_bwd),
-            dim=-1,
-        )
-        direction_gate = torch.sigmoid(self.gate_mlp(relation))
-        fused = direction_gate * z_fwd + (1.0 - direction_gate) * z_bwd
-        entry = self.norm(self.compress(fused))
+        g_in = torch.cat([s_fwd, s_bwd], dim=-1)  # [B, 2*d_sum]
+        g = torch.sigmoid(self.gate_mlp(g_in))    # [B,1] or [B,d_sum]
 
-        return entry, {
-            "s_fwd": z_fwd,
-            "s_bwd": z_bwd,
-            "gate": direction_gate,
-            "s": fused,
+        s = g * s_fwd + (1.0 - g) * s_bwd         # [B, d_sum]
+
+        entry = self.compress(s)                  # [B, d_mem]
+        entry = self.norm(entry)
+
+        # 调试/可视化时会很有用
+        aux = {
+            "s_fwd": s_fwd,
+            "s_bwd": s_bwd,
+            "gate": g,
+            "s": s,
         }
+        return entry, aux

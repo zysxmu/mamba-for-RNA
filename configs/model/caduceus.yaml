@@ -40,8 +40,8 @@ config:
 
   # Memory sidecar
   use_memory: true
-  memory_d_sum: 64
-  memory_d_mem: 64
+  memory_d_sum: 256
+  memory_d_mem: 128
   memory_n_heads: 4
   memory_write_stride: 6
   memory_read_stride: 2

@@ -38,8 +38,8 @@ class CaduceusConfig(PretrainedConfig):
 
             # Memory sidecar
             use_memory: bool = False,
-            memory_d_sum: int = 64,
-            memory_d_mem: int = 64,
+            memory_d_sum: int = 256,
+            memory_d_mem: int = 128,
             memory_n_heads: int = 4,
             memory_write_stride: int = 6,
             memory_read_stride: int = 2,
