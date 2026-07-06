@@ -20,6 +20,7 @@ def test_model_memory_smoke():
 
     model = CaduceusMixerModel(config).to(device).eval()
 
+    # 先固定住 stride，避免复杂度
     model.memory_write_stride = 2
     model.memory_read_stride = 1
 
@@ -34,6 +35,8 @@ def test_model_memory_smoke():
     assert out.shape[0] == B
     assert out.shape[1] == T
 
+
+    # 只要能跑通 + shape 对，就算过
     if hasattr(out, "last_hidden_state"):
         x = out.last_hidden_state
     elif isinstance(out, (tuple, list)):

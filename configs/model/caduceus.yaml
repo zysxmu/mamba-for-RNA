@@ -38,30 +38,14 @@ config:
   bidirectional_weight_tie: true
   rcps: false
 
-  # RNA cross-layer memory
+  # Memory sidecar
   use_memory: true
-  memory_implementation: "lightweight"  # lightweight (default training) | full (ablation)
-  memory_writer_mode: "bcw"  # single | average | scalar_gate | bcw
-  memory_share_direction_projection: true
-  memory_single_direction: "fwd"
   memory_d_sum: 64
   memory_d_mem: 64
-  memory_use_write_score: true
-  memory_num_global_slots: 1
-  memory_num_local_slots: 2
-  memory_pooling: "weighted"  # mean | max | weighted
-  memory_use_layer_embedding: true
-  memory_use_slot_type_embedding: true
-  memory_use_slot_position_embedding: true
   memory_n_heads: 4
-  memory_attn_dropout: 0.0
-  memory_reader_gate_init: -4.0
-  memory_share_reader: true
-  memory_write_stride: 4
+  memory_write_stride: 6
   memory_read_stride: 2
-  memory_max_slots: 12
-  memory_replacement: "fifo"
-  memory_collect_stats: false
+  memory_max_size: 32
   memory_persist_across_batches: false
   pad_token_id: 4
 

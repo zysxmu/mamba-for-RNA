@@ -22,23 +22,10 @@ NUM_DEVICES="${NUM_DEVICES:-8}"
 PER_DEVICE_BATCH="${PER_DEVICE_BATCH:-16}"
 GLOBAL_BATCH="${GLOBAL_BATCH:-256}"
 MAX_LENGTH="${MAX_LENGTH:-1024}"
-MAX_EPOCHS="${MAX_EPOCHS:-null}"
+MAX_EPOCHS="${MAX_EPOCHS:-50}"
 MAX_STEPS="${MAX_STEPS:-20000}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
-PRECISION="${PRECISION:-bf16}"
-VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-100}"
 RUN_DIR="${RUN_DIR:-outputs/pretrain_rna/${SLURM_JOB_ID:-manual}}"
-
-if [[ -z "${WARMUP_STEPS:-}" ]]; then
-  WARMUP_STEPS=$(( MAX_STEPS / 5 ))
-fi
-if (( WARMUP_STEPS < 1 )); then
-  WARMUP_STEPS=1
-fi
-if (( WARMUP_STEPS >= MAX_STEPS )); then
-  WARMUP_STEPS=$(( MAX_STEPS - 1 ))
-fi
-DECAY_STEPS=$(( MAX_STEPS - WARMUP_STEPS ))
 
 # Activate the environment before submitting, or export an activation command,
 # for example: ENV_ACTIVATE='source ~/miniconda3/bin/activate caduceus_env'
@@ -48,27 +35,54 @@ fi
 
 export HYDRA_FULL_ERROR=1
 export TOKENIZERS_PARALLELISM=false
-export NCCL_ASYNC_ERROR_HANDLING=1
-export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 
-# Lightning uses the Slurm-provided ranks: one task per GPU. NUM_DEVICES must
-# match both --ntasks-per-node and --gres above.
-srun --ntasks="${NUM_DEVICES}" --kill-on-bad-exit=1 python -m train \
-  experiment=rna_pretrain \
+srun python -m train \
+  experiment=hg38/hg38 \
+  model=caduceus \
+  dataset.dataset_name=mixed_rna \
+  +dataset.text_file="${RNA_TEXT_FILE}" \
+  +dataset.rna_fasta_file="${RNA_FASTA_FILE}" \
+  dataset.tokenizer_name=char \
+  +dataset.kmer=1 \
+  +dataset.frame=0 \
   dataset.max_length="${MAX_LENGTH}" \
   dataset.max_length_val="${MAX_LENGTH}" \
   dataset.max_length_test="${MAX_LENGTH}" \
   dataset.batch_size="${PER_DEVICE_BATCH}" \
   dataset.batch_size_eval="${PER_DEVICE_BATCH}" \
   loader.num_workers="${NUM_WORKERS}" \
+  dataset.mlm=true \
+  dataset.mlm_probability=0.15 \
+  model.config.d_model=768 \
+  model.config.n_layer=12 \
+  model.config.vocab_size=12 \
+  model.config.bidirectional=true \
+  model.config.bidirectional_strategy=add \
+  model.config.bidirectional_weight_tie=true \
+  model.config.rcps=false \
+  model.config.use_memory=true \
+  model.config.memory_persist_across_batches=false \
+  optimizer.lr=8e-5 \
+  optimizer.weight_decay=0.01 \
+  'optimizer.betas=[0.9,0.98]' \
   train.global_batch_size="${GLOBAL_BATCH}" \
   train.ckpt=checkpoints/last.ckpt \
   trainer.devices="${NUM_DEVICES}" \
   trainer.num_nodes=1 \
-  trainer.precision="${PRECISION}" \
+  trainer.precision=16 \
+  trainer.gradient_clip_val=0.5 \
   trainer.max_epochs="${MAX_EPOCHS}" \
   trainer.max_steps="${MAX_STEPS}" \
-  trainer.val_check_interval="${VAL_CHECK_INTERVAL}" \
-  scheduler.t_initial="${DECAY_STEPS}" \
-  scheduler.warmup_t="${WARMUP_STEPS}" \
+  trainer.num_sanity_val_steps=0 \
+  +trainer.val_check_interval=100 \
+  scheduler._name_=cosine_warmup_timm \
+  scheduler.t_initial="${MAX_STEPS}" \
+  scheduler.warmup_t=4000 \
+  scheduler.lr_min=2e-5 \
+  scheduler.warmup_lr_init=1e-6 \
+  wandb=null \
+  train.monitor=val/loss \
+  train.mode=min \
+  callbacks.model_checkpoint.monitor=val/loss \
+  callbacks.model_checkpoint.mode=min \
   hydra.run.dir="${RUN_DIR}"

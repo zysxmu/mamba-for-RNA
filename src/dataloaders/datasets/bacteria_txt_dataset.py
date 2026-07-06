@@ -4,15 +4,15 @@ from torch.utils.data import Dataset
 
 class BacteriaTxtDataset(Dataset):
     """
-    TXT dataset for nucleotide sequences with optional MLM.
+    细菌序列 TXT 数据集（支持 MLM）
 
-    Expected line format:
+    每行格式:
         SEQUENCE,...
 
-    Normalization:
+    处理流程:
         upper()
         T -> U
-        non-AUCG -> N
+        非 AUCG -> N
     """
 
     def __init__(
@@ -66,7 +66,7 @@ class BacteriaTxtDataset(Dataset):
                 # T -> U
                 seq = seq.replace("T", "U")
 
-                # Replace non-AUCG characters with the unknown base.
+                # 非 AUCG -> N
                 seq = "".join(ch if ch in allowed else "N" for ch in seq)
 
                 self.sequences.append(seq)

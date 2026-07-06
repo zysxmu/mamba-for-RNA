@@ -9,9 +9,8 @@ def build_kmer_vocab(k: int = 3, alphabet: str = "ACGU") -> List[str]:
 
 class KmerTokenizer(PreTrainedTokenizer):
     """
-    Non-overlapping k-mer tokenizer with stride k.
-
-    Example: k=3 maps ACGTTA to ["ACG", "TTA"].
+    非重叠 k-mer tokenizer：每 k 个碱基作为一个 token（步长=k）
+    例：k=3: ACGTTA -> ["ACG","TTA"]
     """
     def __init__(self, k: int = 3, alphabet: str = "ACGU", model_max_length: int = 1024, padding_side: str = "right", **kwargs):
         self.k = int(k)
@@ -40,15 +39,16 @@ class KmerTokenizer(PreTrainedTokenizer):
             **{tok: i + 7 for i, tok in enumerate(kmers)},
         }
         self._vocab_int_to_str = {v: k for k, v in self._vocab_str_to_int.items()}
-        # Map each token ID to its reverse-complement token ID for RCPS.
+                     # ===== 给 RCPS 用的：token id -> 反向互补 token id 映射 =====
         base_comp = {"A": "U", "C": "G", "G": "C", "U": "A"}
 
         def rc_kmer(tok: str) -> str:
+            # tok 形如 "ACG"
             return "".join(base_comp.get(b, "N") for b in reversed(tok))
 
         self.complement_map = {}
         for tok, tid in self._vocab_str_to_int.items():
-            if tok.startswith("["):  # Special tokens map to themselves.
+            if tok.startswith("["):  # special token: 映射到自己
                 self.complement_map[tid] = tid
             else:
                 rctok = rc_kmer(tok)
@@ -84,7 +84,7 @@ class KmerTokenizer(PreTrainedTokenizer):
         toks = []
         for i in range(0, L, self.k):
             tok = text[i:i+self.k]
-            # Use [UNK] if any character is outside the tokenizer alphabet.
+            # 如果含有非字母表字符，标为 [UNK]
             if any(ch not in self.alphabet for ch in tok):
                 toks.append("[UNK]")
             else:
@@ -98,6 +98,7 @@ class KmerTokenizer(PreTrainedTokenizer):
         return self._vocab_int_to_str[index]
 
     def convert_tokens_to_string(self, tokens):
+        # 反拼接
         return "".join([t if t.startswith("[") else t for t in tokens])
 
     def build_inputs_with_special_tokens(self, token_ids_0: List[int], token_ids_1: Optional[List[int]] = None) -> List[int]:

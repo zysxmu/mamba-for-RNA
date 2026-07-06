@@ -1,10 +1,13 @@
 """Caduceus model for Hugging Face.
 
 """
+from caduceus.memory_pool import MemoryPool
+from caduceus.memory_cross_attn import MemoryCrossAttention
+from .memory.writer import BidirectionalMemoryWriter
 import inspect
 import math
 from functools import partial
-from typing import Dict, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 from mamba_ssm.modules.mamba_simple import Mamba
@@ -27,13 +30,6 @@ except ImportError:
         RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
 
 from .configuration_caduceus import CaduceusConfig
-from .memory.bank import CrossLayerMemoryBank
-from .memory.lightweight import (
-    LightweightBidirectionalConsistentMemoryWriter,
-    PooledMemoryReader,
-)
-from .memory.reader import MemoryCrossAttentionReader
-from .memory.writer import BidirectionalConsistentMemoryWriter
 from .modeling_rcps import RCPSAddNormWrapper, RCPSEmbedding, RCPSLMHead, RCPSMambaBlock
 
 
@@ -120,7 +116,7 @@ class BiMambaWrapper(nn.Module):
         self.bidirectional = bidirectional
         self.bidirectional_strategy = bidirectional_strategy
 
-        # Includes layer_idx, device, dtype, and expanded SSM parameters.
+        # 注意：mamba_kwargs 里会包含 layer_idx/device/dtype 以及 ssm_cfg 展开的参数
         self.mamba_fwd = Mamba(d_model=d_model, **mamba_kwargs)
 
         self.mamba_rev = None
@@ -132,7 +128,7 @@ class BiMambaWrapper(nn.Module):
                 self.mamba_rev.out_proj.weight = self.mamba_fwd.out_proj.weight
                 self.mamba_rev.out_proj.bias = self.mamba_fwd.out_proj.bias
 
-        # Cache directional outputs for the memory sidecar.
+        # 缓存两路输出给 memory sidecar
         self.last_fwd = None
         self.last_bwd = None
 
@@ -191,6 +187,20 @@ class CaduceusEmbeddings(nn.Module):
 
 
 
+class MemoryWriterWrapper(nn.Module):
+
+    def __init__(self, d_model: int, d_sum: int = 64, d_mem: int = 64,
+                 pool: str = "mean", gate: str = "vector"):
+        super().__init__()
+        self.writer = BidirectionalMemoryWriter(
+            d_model=d_model, d_sum=d_sum, d_mem=d_mem, pool=pool, gate=gate
+        )
+
+    def forward(self, hidden_states: torch.Tensor, attn_mask: torch.Tensor | None = None):
+        entry, aux = self.writer(hidden_states, hidden_states, attn_mask=attn_mask)
+        return entry, aux
+
+
 class CaduceusMixerModel(nn.Module):
     def __init__(
             self,
@@ -241,151 +251,32 @@ class CaduceusMixerModel(nn.Module):
             config.d_model, eps=config.norm_epsilon, **factory_kwargs
         )
         self.norm_f = norm_f if (config.fused_add_norm or not config.rcps) else RCPSAddNormWrapper(norm_f)
-        # Optional RNA cross-layer memory.
+        # ---- Optional memory sidecar ----
         if config.rcps and config.use_memory:
             raise ValueError(
-                "The RNA memory path is not reverse-complement equivariant. "
+                "The current memory sidecar is not reverse-complement equivariant. "
                 "Set use_memory=false when rcps=true."
             )
-        if config.use_memory and config.memory_persist_across_batches:
-            raise ValueError(
-                "RNA memory is forward-local. Cross-batch persistence would mix "
-                "unrelated RNA samples and is not supported."
-            )
-        if (
-            config.use_memory
-            and config.memory_writer_mode != "single"
-            and not config.bidirectional
-        ):
-            raise ValueError(
-                f"memory_writer_mode={config.memory_writer_mode!r} requires bidirectional=true"
-            )
-
         self.use_memory = config.use_memory
-        self.memory_collect_stats = config.memory_collect_stats
-        self.last_memory_stats: Dict[str, torch.Tensor] = {}
-        self.last_memory_attention = None
-        self.metrics: Dict[str, torch.Tensor] = {}
+        self.memory_persist_across_batches = config.memory_persist_across_batches
         hidden_dim = config.d_model * (2 if config.rcps else 1)
 
         if self.use_memory:
-            writer_cls = (
-                LightweightBidirectionalConsistentMemoryWriter
-                if config.memory_implementation == "lightweight"
-                else BidirectionalConsistentMemoryWriter
-            )
-            self.memory_writer = writer_cls(
+            self.memory_writer = MemoryWriterWrapper(
                 d_model=hidden_dim,
                 d_sum=config.memory_d_sum,
                 d_mem=config.memory_d_mem,
-                n_layer=config.n_layer,
-                writer_mode=config.memory_writer_mode,
-                share_direction_projection=config.memory_share_direction_projection,
-                single_direction=config.memory_single_direction,
-                use_write_score=config.memory_use_write_score,
-                num_global_slots=config.memory_num_global_slots,
-                num_local_slots=config.memory_num_local_slots,
-                pooling=config.memory_pooling,
-                use_layer_embedding=config.memory_use_layer_embedding,
-                use_slot_type_embedding=config.memory_use_slot_type_embedding,
-                use_slot_position_embedding=config.memory_use_slot_position_embedding,
+                pool="mean",
+                gate="vector",
+            )
+            self.memory_pool = MemoryPool(max_size=config.memory_max_size)
+            self.memory_attn = MemoryCrossAttention(
+                d_model=hidden_dim,
+                d_mem=config.memory_d_mem,
+                n_heads=config.memory_n_heads,
             )
             self.memory_write_stride = config.memory_write_stride
             self.memory_read_stride = config.memory_read_stride
-            self.memory_max_slots = config.memory_max_slots
-            self.memory_replacement = config.memory_replacement
-            self.memory_share_reader = config.memory_share_reader
-
-            if config.memory_implementation == "lightweight":
-                reader_cls = PooledMemoryReader
-                reader_kwargs = {
-                    "d_model": hidden_dim,
-                    "d_mem": config.memory_d_mem,
-                }
-            else:
-                reader_cls = MemoryCrossAttentionReader
-                reader_kwargs = {
-                    "d_model": hidden_dim,
-                    "d_mem": config.memory_d_mem,
-                    "n_heads": config.memory_n_heads,
-                    "dropout": config.memory_attn_dropout,
-                }
-            if self.memory_share_reader:
-                self.memory_attn = reader_cls(**reader_kwargs)
-            else:
-                read_layers = [
-                    i
-                    for i in range(1, config.n_layer)
-                    if i % self.memory_read_stride == 0
-                ]
-                self.memory_readers = nn.ModuleDict(
-                    {
-                        str(layer_idx): reader_cls(**reader_kwargs)
-                        for layer_idx in read_layers
-                    }
-                )
-
-            self.memory_read_gates = nn.Parameter(
-                torch.full(
-                    (config.n_layer,),
-                    float(config.memory_reader_gate_init),
-                    device=device,
-                    dtype=dtype,
-                )
-            )
-
-    def _memory_reader(self, layer_idx: int) -> nn.Module:
-        if self.memory_share_reader:
-            return self.memory_attn
-        return self.memory_readers[str(layer_idx)]
-
-    @staticmethod
-    def _append_stats(
-        destination: Dict[str, list],
-        source: Dict[str, torch.Tensor],
-    ) -> None:
-        for name, value in source.items():
-            destination.setdefault(name, []).append(value.detach())
-
-    @staticmethod
-    def _finalize_stats(stats: Dict[str, list]) -> Dict[str, torch.Tensor]:
-        finalized = {}
-        for name, values in stats.items():
-            if not values:
-                continue
-            finalized[name] = torch.stack(
-                [value.float().reshape(()) for value in values]
-            ).mean()
-        return finalized
-
-    def memory_gradient_stats(self) -> Dict[str, torch.Tensor]:
-        """Return detached gradient norms after backward."""
-        if not self.use_memory:
-            return {}
-
-        groups = {
-            "bcw_gradient_norm": "memory_writer.directional_fusion",
-            "memory_writer_gradient_norm": "memory_writer",
-            "memory_reader_gradient_norm": (
-                "memory_attn" if self.memory_share_reader else "memory_readers"
-            ),
-        }
-        stats = {}
-        named_parameters = dict(self.named_parameters())
-        for stat_name, prefix in groups.items():
-            squared = None
-            for name, parameter in named_parameters.items():
-                if not name.startswith(prefix) or parameter.grad is None:
-                    continue
-                value = parameter.grad.detach().float().pow(2).sum()
-                squared = value if squared is None else squared + value
-            if squared is not None:
-                stats[stat_name] = squared.sqrt()
-
-        gate_grad = self.memory_read_gates.grad
-        if gate_grad is not None:
-            stats["memory_read_gate_gradient_norm"] = gate_grad.detach().float().norm()
-        return stats
 
     def forward(
         self,
@@ -393,10 +284,10 @@ class CaduceusMixerModel(nn.Module):
         inputs_embeds=None,
         attention_mask=None,
         output_hidden_states=False,
-        disable_memory_read=False,
-        return_memory_stats=False,
-        return_memory_attention=False,
     ):
+        if self.use_memory and not self.memory_persist_across_batches:
+            self.memory_pool.reset()
+
         all_hidden_states = []
 
         if inputs_embeds is not None:
@@ -411,19 +302,16 @@ class CaduceusMixerModel(nn.Module):
 
         residual = None
 
-        collect_memory_stats = (
-            self.use_memory and (self.memory_collect_stats or return_memory_stats)
-        )
-        raw_memory_stats: Dict[str, list] = {}
-        self.last_memory_attention = None
-        memory_bank = (
-            CrossLayerMemoryBank(
-                max_slots=self.memory_max_slots,
-                replacement=self.memory_replacement,
-            )
-            if self.use_memory
-            else None
-        )
+        # Snapshot only entries from earlier batches. Entries written below are
+        # read through local_entries so their writer graph remains trainable.
+        memory_global = None
+        if self.use_memory and self.memory_persist_across_batches:
+            memory_global = self.memory_pool.get()
+            if memory_global is not None and memory_global.shape[0] != hidden_states.shape[0]:
+                self.memory_pool.reset()
+                memory_global = None
+
+        local_entries = []
 
         for i, layer in enumerate(self.layers):
             if output_hidden_states:
@@ -432,70 +320,42 @@ class CaduceusMixerModel(nn.Module):
             hidden_states, residual = layer(hidden_states, residual, inference_params=None)
 
             if self.use_memory:
-                # Strict read-before-write: layer i can only read slots created
-                # by earlier layers in this same forward pass.
-                bank_contents = memory_bank.get()
-                if (
-                    bank_contents is not None
-                    and (i % self.memory_read_stride) == 0
-                    and not disable_memory_read
-                ):
-                    memory, memory_mask = bank_contents
-                    reader_output = self._memory_reader(i)(
-                        hidden_states=hidden_states,
-                        memory_bank=memory,
-                        memory_mask=memory_mask,
-                        query_mask=attention_mask,
-                        return_attention=return_memory_attention,
-                        collect_stats=collect_memory_stats,
-                    )
-                    alpha = torch.sigmoid(self.memory_read_gates[i]).to(hidden_states.dtype)
-                    memory_residual = alpha * reader_output.memory_output
-                    if collect_memory_stats:
-                        hidden_norm = (
-                            hidden_states.detach().float().norm().clamp_min(1e-12)
-                        )
-                    hidden_states = hidden_states + memory_residual
+                # Read only memories that existed before this layer. This avoids
+                # letting a layer attend to a summary of its own output.
+                memory_local = (
+                    torch.stack(local_entries, dim=1)
+                    if local_entries else None
+                )
+                if memory_global is None:
+                    memory = memory_local
+                elif memory_local is None:
+                    memory = memory_global
+                else:
+                    memory = torch.cat([memory_global, memory_local], dim=1)
 
-                    if return_memory_attention:
-                        self.last_memory_attention = reader_output.attention_weights
-                    if collect_memory_stats:
-                        memory_ratio = (
-                            memory_residual.detach().float().norm() / hidden_norm
-                        )
-                        self._append_stats(raw_memory_stats, reader_output.stats)
-                        raw_memory_stats.setdefault("memory_hidden_ratio", []).append(
-                            memory_ratio.detach()
-                        )
-                        raw_memory_stats.setdefault("reader_gate", []).append(
-                            alpha.detach()
-                        )
-                        raw_memory_stats.setdefault("hidden_state_norm", []).append(
-                            hidden_norm.detach()
-                        )
-                        raw_memory_stats.setdefault(
-                            f"reader_gate_layer_{i}", []
-                        ).append(alpha.detach())
+                if (
+                    memory is not None
+                    and memory.shape[1] > 0
+                    and (i % self.memory_read_stride) == 0
+                ):
+                    hidden_states = hidden_states + self.memory_attn(hidden_states, memory)
 
                 if (i % self.memory_write_stride) == 0:
                     bim = _get_bimamba_from_layer(layer)
-                    if bim is None or bim.last_fwd is None or bim.last_bwd is None:
-                        raise RuntimeError(
-                            f"Cannot obtain directional hidden states from layer {i}"
+                    if bim is not None:
+                        entry, _ = self.memory_writer.writer(
+                            bim.last_fwd,
+                            bim.last_bwd,
+                            attn_mask=attention_mask,
                         )
-                    writer_output = self.memory_writer(
-                        h_fwd=bim.last_fwd,
-                        h_bwd=bim.last_bwd,
-                        attention_mask=attention_mask,
-                        layer_idx=i,
-                        collect_stats=collect_memory_stats,
-                    )
-                    memory_bank.append(
-                        writer_output.memory_slots,
-                        writer_output.slot_mask,
-                    )
-                    if collect_memory_stats:
-                        self._append_stats(raw_memory_stats, writer_output.stats)
+                    else:
+                        entry, _ = self.memory_writer(
+                            hidden_states,
+                            attn_mask=attention_mask,
+                        )
+                    local_entries.append(entry)
+                    if self.memory_persist_across_batches:
+                        self.memory_pool.push(entry)
 
         # ---- final norm  ----
         if not self.fused_add_norm:
@@ -540,31 +400,6 @@ class CaduceusMixerModel(nn.Module):
                     len(all_hidden_states) == 0 or all_hidden_states[-1] is not hidden_states
             ):
                 all_hidden_states.append(hidden_states)
-
-        if collect_memory_stats:
-            bank_contents = memory_bank.get()
-            if bank_contents is not None:
-                memory, memory_mask = bank_contents
-                valid_memory = memory.float().norm(dim=-1).masked_select(memory_mask)
-                raw_memory_stats.setdefault("num_memory_slots", []).append(
-                    memory.new_tensor(memory.shape[1])
-                )
-                raw_memory_stats.setdefault("num_valid_slots", []).append(
-                    memory_mask.float().sum(dim=1).mean()
-                )
-                raw_memory_stats.setdefault("memory_bank_norm", []).append(
-                    valid_memory.mean()
-                    if valid_memory.numel()
-                    else memory.new_zeros((), dtype=torch.float)
-                )
-            self.last_memory_stats = self._finalize_stats(raw_memory_stats)
-            self.metrics = {
-                f"memory/{name}": value
-                for name, value in self.last_memory_stats.items()
-            }
-        else:
-            self.last_memory_stats = {}
-            self.metrics = {}
 
         return hidden_states, all_hidden_states
 
@@ -666,9 +501,6 @@ class Caduceus(CaduceusPreTrainedModel):
             attention_mask: Optional[torch.Tensor] = None,
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
-            disable_memory_read: bool = False,
-            return_memory_stats: bool = False,
-            return_memory_attention: bool = False,
     ) -> Union[torch.Tensor, Tuple, BaseModelOutputWithNoAttention]:
 
         output_hidden_states = (
@@ -684,10 +516,7 @@ class Caduceus(CaduceusPreTrainedModel):
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            output_hidden_states=output_hidden_states,
-            disable_memory_read=disable_memory_read,
-            return_memory_stats=return_memory_stats,
-            return_memory_attention=return_memory_attention,
+            output_hidden_states=output_hidden_states
         )
 
         if return_dict:
@@ -758,17 +587,6 @@ class CaduceusForMaskedLM(CaduceusPreTrainedModel):
         """Set decoder (backbone) for the model."""
         self.caduceus = decoder
 
-    @property
-    def last_memory_stats(self) -> Dict[str, torch.Tensor]:
-        return self.caduceus.backbone.last_memory_stats
-
-    @property
-    def last_memory_attention(self):
-        return self.caduceus.backbone.last_memory_attention
-
-    def memory_gradient_stats(self) -> Dict[str, torch.Tensor]:
-        return self.caduceus.backbone.memory_gradient_stats()
-
     def forward(
             self,
             input_ids: torch.LongTensor = None,
@@ -778,9 +596,6 @@ class CaduceusForMaskedLM(CaduceusPreTrainedModel):
             loss_weights: Optional[torch.FloatTensor] = None,
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
-            disable_memory_read: bool = False,
-            return_memory_stats: bool = False,
-            return_memory_attention: bool = False,
     ) -> Union[Tuple, MaskedLMOutput]:
         """HF-compatible forward method."""
 
@@ -796,9 +611,6 @@ class CaduceusForMaskedLM(CaduceusPreTrainedModel):
             attention_mask=attention_mask,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            disable_memory_read=disable_memory_read,
-            return_memory_stats=return_memory_stats,
-            return_memory_attention=return_memory_attention,
         )
 
         hidden_states = outputs[0]

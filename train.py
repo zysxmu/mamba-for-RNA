@@ -5,9 +5,6 @@
 import json
 import os
 import random
-import shlex
-import subprocess
-import sys
 import time
 from functools import wraps
 from typing import Callable, List, Sequence
@@ -257,57 +254,6 @@ class SequenceLightningModule(pl.LightningModule):
         # strict==False can allow encoder/decoder to be loaded from scratch too
         return super().load_state_dict(state_dict, strict=strict)
 
-    def load_compatible_pretrained(self, checkpoint_path):
-        """Warm-start from keys whose names and shapes match this model.
-
-        This is intentionally separate from Lightning resume. Resume must use
-        ``train.ckpt`` and restores the exact model, optimizer, scheduler, and
-        global step. This method initializes a new architecture from a baseline
-        checkpoint and never silently accepts shape mismatches.
-        """
-        checkpoint = torch.load(checkpoint_path, map_location="cpu")
-        source_state = checkpoint.get("state_dict", checkpoint)
-        current_state = self.state_dict()
-
-        compatible = {}
-        unexpected = []
-        shape_mismatches = {}
-        for name, value in source_state.items():
-            if name not in current_state:
-                unexpected.append(name)
-            elif current_state[name].shape != value.shape:
-                shape_mismatches[name] = {
-                    "checkpoint": list(value.shape),
-                    "model": list(current_state[name].shape),
-                }
-            else:
-                compatible[name] = value
-
-        missing = sorted(set(current_state) - set(compatible))
-        result = self.load_state_dict(compatible, strict=False)
-
-        backbone_keys = [
-            name
-            for name in current_state
-            if name.startswith("model.") and "memory_" not in name
-        ]
-        loaded_backbone = sum(
-            current_state[name].numel() for name in backbone_keys if name in compatible
-        )
-        total_backbone = sum(current_state[name].numel() for name in backbone_keys)
-        backbone_ratio = loaded_backbone / max(1, total_backbone)
-
-        report = {
-            "checkpoint": str(checkpoint_path),
-            "loaded_keys": len(compatible),
-            "missing_keys": missing,
-            "unexpected_keys": sorted(unexpected),
-            "shape_mismatches": shape_mismatches,
-            "backbone_parameter_ratio": backbone_ratio,
-        }
-        log.info("Compatible warm-start report:\n%s", json.dumps(report, indent=2))
-        return result, report
-
     def _check_config(self):
         assert self.hparams.train.state.mode in [None, "none", "null", "reset", "bptt", "tbptt"]
         assert (
@@ -496,23 +442,6 @@ class SequenceLightningModule(pl.LightningModule):
         )
         return loss
 
-    def on_after_backward(self):
-        interval = int(self.hparams.train.get("memory_gradient_log_interval", 0))
-        if interval <= 0 or self.global_step % interval != 0:
-            return
-        if not hasattr(self.model, "memory_gradient_stats"):
-            return
-        stats = self.model.memory_gradient_stats()
-        if not stats:
-            return
-        self.log_dict(
-            {f"memory_grad/{name}": value for name, value in stats.items()},
-            on_step=True,
-            on_epoch=False,
-            prog_bar=False,
-            sync_dist=True,
-        )
-
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         # There's a bit of an annoying edge case with the first (0-th) epoch; it has to be excluded due to the initial
         # sanity check
@@ -660,11 +589,11 @@ class SequenceLightningModule(pl.LightningModule):
         return eval_loader_names, eval_loaders
 
     def val_dataloader(self):
-            # Keep checkpoint selection restricted to validation data.
+            #  validation loop 只跑 val，用来选 best ckpt
             val_loaders = self.dataset.val_dataloader(**self.hparams.loader)
             val_loader_names, val_loaders = self._eval_dataloaders_names(val_loaders, "val")
 
-            # Evaluate both regular and EMA weights when EMA is enabled.
+            # EMA ，val 照旧复制一份
             if self.hparams.train.ema > 0.0:
                 val_loader_names += [name + "/ema" for name in val_loader_names]
                 val_loaders = val_loaders + val_loaders
@@ -712,6 +641,7 @@ def create_trainer(config, **kwargs):
         if max_epochs is None and (max_steps is None or int(max_steps) <= 0):
             raise ValueError("Set either trainer.max_epochs or a positive trainer.max_steps.")
 
+        # 周期保存
         if "periodic_checkpoint" in config.callbacks:
             if max_epochs is not None:
                 save_interval = max(1, int(max_epochs) // 10)
@@ -736,6 +666,7 @@ def create_trainer(config, **kwargs):
                 f"dirpath={config.callbacks.periodic_checkpoint.get('dirpath', None)}"
             )
 
+        # best checkpoint：保留原逻辑
         if "model_checkpoint" in config.callbacks:
             if config.callbacks.model_checkpoint.get("save_top_k", None) is None:
                 config.callbacks.model_checkpoint.save_top_k = 1
@@ -752,7 +683,7 @@ def create_trainer(config, **kwargs):
             if config.get("wandb") is None and _name_ in ["learning_rate_monitor"]:
                 continue
 
-            # periodic_checkpoint is an additional ModelCheckpoint instance.
+            # 对未注册的 periodic_checkpoint，直接按 ModelCheckpoint 实例化
             if _name_ == "periodic_checkpoint":
                 log.info("Instantiating callback <pytorch_lightning.callbacks.ModelCheckpoint> for periodic_checkpoint")
                 callbacks.append(
@@ -778,7 +709,7 @@ def create_trainer(config, **kwargs):
     if n_devices > 1 and config.trainer.get("strategy", None) is None:
         config.trainer.strategy = dict(
             _target_="pytorch_lightning.strategies.DDPStrategy",
-            find_unused_parameters=False,
+            find_unused_parameters=True,
             gradient_as_bucket_view=True,
         )
 
@@ -795,69 +726,6 @@ def fsspec_exists(filename):
     return fs.exists(filename)
 
 
-@rank_zero_only
-def write_run_metadata(config, model, warm_start_report=None):
-    """Persist reproducibility metadata in the Hydra run directory."""
-    run_dir = os.getcwd()
-    source_dir = hydra.utils.get_original_cwd()
-
-    try:
-        git_commit = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            cwd=source_dir,
-            text=True,
-        ).strip()
-    except (OSError, subprocess.SubprocessError):
-        git_commit = "unavailable"
-
-    try:
-        git_status = subprocess.check_output(
-            ["git", "status", "--porcelain"],
-            cwd=source_dir,
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
-        git_dirty = bool(git_status.strip())
-    except (OSError, subprocess.SubprocessError):
-        git_dirty = None
-
-    parameter_counts = {
-        "total": sum(parameter.numel() for parameter in model.parameters()),
-        "trainable": sum(
-            parameter.numel()
-            for parameter in model.parameters()
-            if parameter.requires_grad
-        ),
-        "bcw": sum(
-            parameter.numel()
-            for name, parameter in model.named_parameters()
-            if "memory_writer.directional_fusion" in name
-        ),
-        "memory_total": sum(
-            parameter.numel()
-            for name, parameter in model.named_parameters()
-            if "memory_" in name
-        ),
-    }
-    parameter_counts["backbone_non_memory"] = (
-        parameter_counts["total"] - parameter_counts["memory_total"]
-    )
-
-    metadata = {
-        "git_commit": git_commit,
-        "git_dirty": git_dirty,
-        "command": shlex.join(sys.argv),
-        "seed": config.train.seed,
-        "global_batch_size": config.train.get("global_batch_size", None),
-        "parameter_counts": parameter_counts,
-        "warm_start": warm_start_report,
-    }
-    with open(os.path.join(run_dir, "run_metadata.json"), "w", encoding="utf-8") as handle:
-        json.dump(metadata, handle, indent=2, ensure_ascii=False)
-    with open(os.path.join(run_dir, "resolved_config.yaml"), "w", encoding="utf-8") as handle:
-        handle.write(OmegaConf.to_yaml(config, resolve=True))
-
-
 def train(config):
     if config.train.seed is not None:
         pl.seed_everything(config.train.seed, workers=True)
@@ -865,23 +733,13 @@ def train(config):
     trainer = create_trainer(config)
     model = SequenceLightningModule(config)
 
-    warm_start_report = None
-    # A pretrained model is an initialization source, not an exact resume.
-    # Exact resume is handled by trainer.fit(..., ckpt_path=train.ckpt).
+    # Load pretrained_model if specified
     if config.train.get("pretrained_model_path", None) is not None:
-        if config.train.pretrained_model_strict_load:
-            checkpoint = torch.load(
-                config.train.pretrained_model_path,
-                map_location="cpu",
-            )
-            state_dict = checkpoint.get("state_dict", checkpoint)
-            model.load_state_dict(state_dict, strict=True)
-        else:
-            _, warm_start_report = model.load_compatible_pretrained(
-                config.train.pretrained_model_path
-            )
-
-    write_run_metadata(config, model, warm_start_report)
+        model = SequenceLightningModule.load_from_checkpoint(
+            config.train.pretrained_model_path,
+            config=config,
+            strict=config.train.pretrained_model_strict_load,
+        )
 
     # Optional validation before training
     if config.train.validate_at_start:
@@ -897,6 +755,7 @@ def train(config):
         trainer.fit(model)
 
     if config.train.test:
+        # test 阶段只跑 true test，不混 val
         config.train.update({"remove_val_loader_in_eval": True})
         config.train.update({"remove_test_loader_in_eval": False})
 
@@ -916,7 +775,7 @@ def train(config):
                 )
                 trainer.test(model)
         else:
-            # Select the checkpoint callback that monitors the configured metric.
+            # Lightning 里可能有多个 ModelCheckpoint callback，手动找 monitor=val/loss 的那个
             best_ckpt_path = None
             for cb in trainer.callbacks:
                 if isinstance(cb, pl.callbacks.ModelCheckpoint):
@@ -939,7 +798,7 @@ def train(config):
 
 
 
-@hydra.main(version_base=None, config_path="configs", config_name="config.yaml")
+@hydra.main(config_path="configs", config_name="config.yaml")
 def main(config: OmegaConf):
     # Process config:
     # - register evaluation resolver

@@ -5,11 +5,10 @@ Adapted from:
     https://pytorch-lightning.readthedocs.io/en/latest/_modules/pytorch_lightning/callbacks/gpu_stats_monitor.html#GPUStatsMonitor
 """
 
-import json
+# We only need the speed monitoring, not the GPU monitoring
 import time
 from typing import Any
 
-import torch
 from pytorch_lightning import Callback, Trainer, LightningModule
 from pytorch_lightning.utilities import rank_zero_only
 from pytorch_lightning.utilities.parsing import AttributeDict
@@ -36,11 +35,6 @@ class Timer(Callback):
 
     def on_train_start(self, trainer: Trainer, pl_module: LightningModule) -> None:
         self._snap_epoch_time = None
-        self._step_time_total = 0.0
-        self._tokens_total = 0
-        self._timed_steps = 0
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
 
     def on_train_epoch_start(self, trainer: Trainer, pl_module: LightningModule) -> None:
         self._snap_step_time = None
@@ -79,23 +73,13 @@ class Timer(Callback):
         if self._log_stats.inter_step_time:
             self._snap_inter_step_time = time.time()
 
-        logs = {}
-        if self._log_stats.step_time and self._snap_step_time:
-            elapsed = time.time() - self._snap_step_time
-            self._step_time_total += elapsed
-            self._timed_steps += 1
-            logs["timer/step"] = elapsed
-            if isinstance(batch, (tuple, list)) and torch.is_tensor(batch[0]):
-                processed_tokens = batch[0].numel() * max(1, trainer.world_size)
-                self._tokens_total += processed_tokens
-                logs["timer/tokens_per_second"] = processed_tokens / max(elapsed, 1e-12)
-            if torch.cuda.is_available():
-                logs["timer/peak_memory_gib"] = (
-                    torch.cuda.max_memory_allocated() / (1024 ** 3)
-                )
-
         if not self._should_log(trainer):
             return
+
+        logs = {}
+        if self._log_stats.step_time and self._snap_step_time:
+            logs["timer/step"] = (time.time() - self._snap_step_time) # * 1000
+
         if trainer.logger: trainer.logger.log_metrics(logs, step=trainer.global_step)
 
     @rank_zero_only
@@ -114,25 +98,6 @@ class Timer(Callback):
         if self._log_stats.val_time and self._snap_val_time:
             logs["timer/validation"] = time.time() - self._snap_val_time
         if trainer.logger: trainer.logger.log_metrics(logs) # , step=trainer.global_step)
-
-    @rank_zero_only
-    def on_train_end(self, trainer: Trainer, pl_module: LightningModule) -> None:
-        elapsed = max(self._step_time_total, 1e-12)
-        metrics = {
-            "timed_steps": self._timed_steps,
-            "mean_step_time_seconds": (
-                self._step_time_total / max(1, self._timed_steps)
-            ),
-            "processed_tokens": self._tokens_total,
-            "mean_tokens_per_second": self._tokens_total / elapsed,
-            "peak_memory_gib": (
-                torch.cuda.max_memory_allocated() / (1024 ** 3)
-                if torch.cuda.is_available()
-                else 0.0
-            ),
-        }
-        with open("runtime_metrics.json", "w", encoding="utf-8") as handle:
-            json.dump(metrics, handle, indent=2)
 
     @staticmethod
     def _should_log(trainer) -> bool:

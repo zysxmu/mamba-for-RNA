@@ -11,7 +11,7 @@ class MixedRNADataset(Dataset):
     Unified preprocessing:
     - upper()
     - T -> U
-    - discard records containing non-A/U/C/G characters
+    - non-A/U/C/G -> N
 
     Returns:
         (input_ids, labels)
@@ -106,10 +106,17 @@ class MixedRNADataset(Dataset):
         return len(self.sequences)
 
     def _normalize_seq(self, seq: str) -> str:
-        """Normalize T to U and retain only canonical A/U/C/G records."""
+        """
+        Normalize sequence:
+        - uppercase
+        - T -> U
+        - ONLY keep AUCG sequences
+        - if any illegal char exists → drop entire sequence
+        """
         seq = seq.strip().upper().replace("T", "U")
         allowed = {"A", "U", "C", "G"}
 
+        # 如果有非法字符 → 整条丢弃
         if any(ch not in allowed for ch in seq):
             return ""
 

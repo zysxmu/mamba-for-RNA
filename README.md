@@ -1,114 +1,84 @@
 # RNA-Mamba
 
-RNA-Mamba is a memory-augmented bidirectional Mamba model for RNA masked
-language modeling. It uses the Caduceus BiMamba backbone and adds two
-RNA-specific components:
+RNA-Mamba is a bidirectional Mamba model for same-position RNA masked language
+modeling. This implementation keeps the original project structure from
+commit `bea4cda9a88e4e45490cfabc425e7dd32be29483` and applies only correctness
+fixes plus a lightweight cross-layer memory path.
 
-1. **Bidirectional Consistent Writing (BCW)** aligns forward and backward
-   states, pools them over identical RNA regions, and learns a feature-wise
-   directional fusion for each summary slot.
-2. **Cross-layer multi-slot memory** compresses the fused states into global
-   and regional slots that later layers read through a gated pooled reader.
+## Model
 
-The implementation is intended for reproducible pretraining, ablation studies,
-and multi-GPU Slurm runs.
+Each layer contains the original weight-tied BiMamba backbone. At configured
+write layers, the lightweight Bidirectional Consistent Writer (BCW):
 
-## Architecture
+1. aligns forward and backward states by RNA position;
+2. mean-pools valid tokens before any learned projection;
+3. applies a shared projection to both directions;
+4. builds directional relation features;
+5. learns a feature-wise gate and writes one compressed memory vector.
 
-```text
-RNA tokens [B, L]
-  -> BiMamba layer
-     -> aligned forward states  [B, L, d_model]
-     -> aligned backward states [B, L, d_model]
-  -> read memory written by earlier layers
-  -> aligned global + regional pooling
-  -> BCW directional fusion     [B, S, d_sum]
-  -> memory compression         [B, S, d_mem]
-  -> FIFO cross-layer bank      [B, M, d_mem]
-  -> pooled memory projection and gated residual
-  -> same-position MLM head
+Later layers read only entries written by earlier layers. The reader averages
+the small memory bank once per sample and projects the result into the hidden
+dimension. It does not run token-to-memory multi-head attention, so its learned
+matrix cost does not grow with sequence length.
+
+Default memory settings:
+
+```yaml
+use_memory: true
+memory_d_sum: 64
+memory_d_mem: 64
+memory_write_stride: 6
+memory_read_stride: 2
+memory_persist_across_batches: false
 ```
 
-Each layer reads before it writes, so a layer cannot read its own newly created
-slots. Memory exists only inside one forward pass and is never shared between
-independent RNA samples or batches. Padding is excluded from fusion statistics
-and slot pooling.
+Memory is local to one forward pass and is never shared across independent RNA
+samples or batches.
 
-The default `lightweight` implementation pools before the learned BCW
-projections and projects one bank summary per sample when reading. Its learned
-matrix operations therefore depend on the small number of slots rather than
-the sequence length. The original token-level writer and multi-head
-cross-attention reader remain available as the `full` ablation.
+## Correctness fixes relative to `bea4cda`
 
-## Default pretraining configuration
+- MLM logits and labels remain aligned at the same sequence positions.
+- PAD and EOS tokens are excluded from MLM selection.
+- Random MLM replacements are restricted to RNA base tokens.
+- Validation and test masking are deterministic.
+- Forward and backward summaries use the same valid-token mask.
+- A layer reads memory before writing its own state.
+- The writer runs only on configured write layers.
+- Memory is not duplicated in both detached and differentiable banks.
+- Evaluation batches cannot leak memory into one another.
+- Memory parameters receive gradients from the MLM objective.
+- Input embeddings are created only once and attention masks reach the model.
 
-The formal configuration is
-[`configs/experiment/rna_pretrain.yaml`](configs/experiment/rna_pretrain.yaml):
-
-- 12 BiMamba layers, `d_model=768`;
-- sequence length 1024;
-- A/U/C/G/N character tokenizer;
-- 15% same-position MLM;
-- lightweight BCW with `d_sum=64`;
-- one global and two valid-length-aware regional slots per write layer;
-- learned write importance and `d_mem=64`;
-- write stride 4, read stride 2, and a 12-slot FIFO bank;
-- one shared pooled memory reader with an independent gate per read layer;
-- FP16, AdamW, gradient clipping, and cosine decay with warmup.
-
-The reader gates start conservatively at `-4.0` before the sigmoid. This keeps
-the pretrained backbone path dominant at initialization while still allowing
-memory gradients to flow.
-
-## Dataset
+## Data
 
 Provide one TXT corpus and one FASTA corpus:
 
 ```text
 data/
-├── data-random_15K_sequences.txt
-└── rnacentral_small_ATCG_only.fasta
+  data-random_15K_sequences.txt
+  rnacentral_small_ATCG_only.fasta
 ```
 
-- TXT: one sequence per line; when commas are present, only the first field is
-  used.
-- FASTA: standard multiline records are supported.
-- Input is uppercased and `T` is normalized to `U`.
-- The current mixed-RNA corpus loader retains canonical `A/U/C/G` sequences;
-  the tokenizer also contains `N` for masking and compatible inputs.
-- The split is deterministic: 80% train, 10% validation, and 10% test.
-- Training masking is dynamic; validation and test masking are deterministic.
+Sequences are uppercased, `T` is converted to `U`, and records containing
+characters outside `A/U/C/G` are discarded.
 
-Data files are excluded from Git. On a cluster, use absolute paths visible from
-every compute node.
+## Environment
 
-## Installation
-
-CUDA training requires Linux, a Linux cluster, or WSL2.
-
-- Python 3.10
-- PyTorch 2.2.0 with CUDA 12.1
-- `causal-conv1d==1.2.0.post2`
-- `mamba-ssm==1.2.2`
+The tested cluster environment uses Python 3.10, PyTorch 2.2, CUDA 12.x,
+`causal-conv1d==1.2.0.post2`, and `mamba-ssm==1.2.2`.
 
 ```bash
 bash setup_linux_env.sh
-source .venv/bin/activate
 ```
 
-`requirements-core.txt` contains the dependencies used by the RNA pretraining
-path. `requirements.txt` retains the original full environment export.
+## Pretraining
 
-## Epoch-based pretraining
-
-The original epoch-based training entry point is retained. BCW and cross-layer
-memory are selected by `model=caduceus`; they do not replace the optimizer,
-dataset, scheduler, validation, or checkpoint workflow.
+Single GPU:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 python -m train \
+CUDA_VISIBLE_DEVICES=0 python -m train \
   experiment=hg38/hg38 \
-  trainer.devices=2 \
+  trainer.devices=1 \
   trainer.accelerator=gpu \
   dataset.dataset_name=mixed_rna \
   +dataset.text_file=/absolute/path/data-random_15K_sequences.txt \
@@ -121,6 +91,7 @@ CUDA_VISIBLE_DEVICES=0,1 python -m train \
   dataset.batch_size_eval=64 \
   dataset.mlm=true \
   dataset.mlm_probability=0.15 \
+  loader.num_workers=4 \
   model=caduceus \
   model.config.d_model=768 \
   model.config.n_layer=12 \
@@ -129,7 +100,7 @@ CUDA_VISIBLE_DEVICES=0,1 python -m train \
   model.config.bidirectional_strategy=add \
   model.config.bidirectional_weight_tie=true \
   model.config.rcps=false \
-  model.config.memory_implementation=lightweight \
+  model.config.pad_token_id=4 \
   optimizer.lr=8e-5 \
   optimizer.weight_decay=0.01 \
   'optimizer.betas=[0.9,0.98]' \
@@ -138,195 +109,26 @@ CUDA_VISIBLE_DEVICES=0,1 python -m train \
   trainer.max_epochs=50 \
   trainer.max_steps=20000 \
   trainer.limit_val_batches=1.0 \
-  +trainer.val_check_interval=100 \
+  +trainer.val_check_interval=1.0 \
   trainer.num_sanity_val_steps=0 \
   scheduler._name_=cosine_warmup_timm \
   scheduler.t_initial=30000 \
   scheduler.warmup_t=4000 \
   scheduler.lr_min=2e-5 \
   scheduler.warmup_lr_init=1e-6 \
-  wandb=null \
-  train.monitor=val/loss \
-  train.mode=min \
-  callbacks.model_checkpoint.monitor=val/loss \
-  callbacks.model_checkpoint.mode=min \
-  callbacks.model_checkpoint.dirpath=./checkpoints_best \
-  callbacks.model_checkpoint.filename=val/loss \
-  callbacks.periodic_checkpoint.dirpath=./checkpoints_periodic
+  wandb=null
 ```
 
-## Local smoke test
-
-```bash
-source .venv/bin/activate
-bash run_local_smoke.sh
-```
-
-This runs a small end-to-end GPU job with training, validation, test,
-checkpoint saving, and checkpoint reload. The default output directory is
-`outputs/local-smoke/`.
-
-Useful overrides:
-
-```bash
-PRECISION=bf16 MAX_STEPS=20 RUN_TEST=false \
-RUN_DIR=outputs/local-smoke-20 bash run_local_smoke.sh
-```
-
-## Ablations
-
-All variants use the same training path and can be selected with Hydra
-overrides.
-
-```bash
-# BiMamba baseline
-python -m train experiment=rna_pretrain model.config.use_memory=false
-
-# Single-direction memory writer
-python -m train experiment=rna_pretrain \
-  model.config.memory_writer_mode=single
-
-# Multi-slot memory without learned bidirectional writing
-python -m train experiment=rna_pretrain \
-  model.config.memory_writer_mode=average
-
-# Lightweight BCW + pooled cross-layer memory (training default)
-python -m train experiment=rna_pretrain \
-  model.config.memory_implementation=lightweight \
-  model.config.memory_writer_mode=bcw
-
-# Token-level BCW + multi-head cross-attention (expensive ablation)
-python -m train experiment=rna_pretrain \
-  model.config.memory_implementation=full \
-  model.config.memory_d_sum=256 \
-  model.config.memory_d_mem=128 \
-  model.config.memory_num_local_slots=8 \
-  model.config.memory_max_slots=64
-
-# One global slot only
-python -m train experiment=rna_pretrain \
-  model.config.memory_num_global_slots=1 \
-  model.config.memory_num_local_slots=0
-
-# Mean pooling without a learned write score
-python -m train experiment=rna_pretrain \
-  model.config.memory_pooling=mean \
-  model.config.memory_use_write_score=false
-```
-
-`scalar_gate`, source-embedding switches, reader sharing, and read/write
-strides are also configurable in
-[`configs/model/caduceus.yaml`](configs/model/caduceus.yaml).
-
-BCW is the writer used by the memory path; a nominal "BCW-only" setting with no
-memory consumer would not affect the MLM loss and is therefore not presented
-as a valid ablation.
-
-## Slurm training
-
-The provided script launches one Slurm task per GPU. PyTorch Lightning uses the
-Slurm-provided global and local ranks to form the eight-process DDP job:
-
-```bash
-export RNA_TEXT_FILE=/shared/data/data-random_15K_sequences.txt
-export RNA_FASTA_FILE=/shared/data/rnacentral_small_ATCG_only.fasta
-export ENV_ACTIVATE='source ~/miniconda3/bin/activate rna-mamba'
-
-export NUM_DEVICES=8
-export PER_DEVICE_BATCH=16
-export GLOBAL_BATCH=256
-export MAX_STEPS=20000
-export MAX_EPOCHS=null
-export RUN_DIR=/shared/outputs/rna-mamba
-
-sbatch slurm_scripts/run_pretrain_rna.sh
-```
-
-Run a short cluster smoke test first:
-
-```bash
-export MAX_STEPS=20
-export RUN_DIR=/shared/outputs/rna-mamba-smoke
-sbatch slurm_scripts/run_pretrain_rna.sh
-```
-
-Confirm that every GPU is active, validation completes, memory use remains
-stable, and `checkpoints/last.ckpt` is written before submitting the full run.
-
-The accumulation factor is:
-
-```text
-ceil(global_batch / (nodes * devices_per_node * per_device_batch))
-```
-
-## Checkpoints
-
-Training produces:
-
-```text
-checkpoints_best/       best validation-loss checkpoint
-checkpoints_periodic/   periodic recovery checkpoints
-checkpoints/last.ckpt   latest complete training state
-resolved_config.yaml    resolved Hydra configuration
-run_metadata.json       command, Git state, seed, batch size, and parameter counts
-runtime_metrics.json    step time, throughput, and peak allocated GPU memory
-```
-
-`train.ckpt` performs an exact Lightning resume, including model, optimizer,
-scheduler, and global step. `train.pretrained_model_path` is a separate
-compatible warm-start path: matching backbone tensors are loaded and a
-structured missing/unexpected/shape-mismatch report is written for new memory
-parameters.
-
-With PyTorch Lightning 1.8, a checkpoint taken in the middle of a shuffled
-epoch does not guarantee restoration of the exact dataloader cursor. Model and
-optimizer state are restored, but a few samples may be repeated or skipped.
-Use an epoch-boundary checkpoint when exact sample order is required.
+For two GPUs, use `CUDA_VISIBLE_DEVICES=0,1` and `trainer.devices=2`.
 
 ## Tests
 
+Run tests from the repository root so the local package is importable:
+
 ```bash
-pytest -q \
-  caduceus/tests/test_writer_only.py \
-  caduceus/tests/test_memory_bank_reader.py \
-  caduceus/tests/test_model_memory_smoke.py \
-  caduceus/tests/test_memory_backward.py \
-  caduceus/tests/test_memory_read_before_write.py \
-  caduceus/tests/test_memory_stride_counts.py \
-  caduceus/tests/test_memory_eval_isolation.py \
-  caduceus/tests/test_mixed_rna_dataset.py \
-  caduceus/tests/test_mlm_alignment.py
+python -m pytest -q caduceus/tests
 ```
 
-The suite checks alignment, padding invariance, empty slots, FIFO capacity,
-read-before-write ordering, memory-specific gradients, forward isolation, and
-same-position MLM labels.
-
-## Project structure
-
-```text
-caduceus/memory/        BCW writer, multi-slot summarizer, bank, and reader
-caduceus/               model configuration and BiMamba integration
-configs/                Hydra model, data, pipeline, and experiment settings
-src/dataloaders/        mixed-RNA loading and MLM collation
-src/callbacks/          runtime and validation logging
-slurm_scripts/          cluster submission scripts
-tests/fixtures/         synthetic smoke-test data
-train.py                training, resume, warm-start, and metadata entry point
-```
-
-## Lineage
-
-The backbone is based on Caduceus:
-
-```bibtex
-@article{schiff2024caduceus,
-  title={Caduceus: Bi-Directional Equivariant Long-Range DNA Sequence Modeling},
-  author={Schiff et al.},
-  year={2024}
-}
-```
-
-The cross-layer memory design is inspired by the memory-pattern perspective in
-*MemMamba: Rethinking Memory Patterns in State Space Models* and is reworked
-here for aligned bidirectional RNA states and multi-slot layer memory.
+The suite checks MLM alignment, deterministic masking, memory isolation,
+read-before-write semantics, stride counts, padding-aware BCW, memory
+gradients, and model smoke behavior.

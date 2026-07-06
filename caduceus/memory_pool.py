@@ -10,8 +10,8 @@ class MemoryPool(nn.Module):
         # stats (for tests/debug)
         self._push_calls = 0
         self._get_calls = 0
-        self._get_sizes = []   # Number of entries observed by each get().
-        self._push_sizes = []  # Pool size after each push().
+        self._get_sizes = []   # 每次 get() 时 memory 的 M
+        self._push_sizes = []  # 每次 push() 后池子里条目数
 
     def reset(self):
         self.memory = []
@@ -30,7 +30,7 @@ class MemoryPool(nn.Module):
         if memory_entry.dim() == 2:
             memory_entry = memory_entry.unsqueeze(1)
 
-        # Persistent entries must not retain graphs from earlier steps.
+        #  关键：跨 step 存储必须 detach
         memory_entry = memory_entry.detach()
 
         self.memory.append(memory_entry)
@@ -50,7 +50,7 @@ class MemoryPool(nn.Module):
         if m == 0:
             return None
 
-        # Reset if stale entries belong to a different batch size.
+        #  batch size 不一致时自动 reset
         batch_size = self.memory[0].shape[0]
         for mem in self.memory:
             if mem.shape[0] != batch_size:

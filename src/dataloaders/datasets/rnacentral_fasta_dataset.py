@@ -6,10 +6,10 @@ class RNACentralFastaDataset(Dataset):
     """
     RNAcentral FASTA dataset
 
-    Normalization:
+    处理流程:
         upper()
         T -> U
-        discard records containing non-AUCG characters
+        非 AUCG -> N
     """
 
     def __init__(
@@ -71,7 +71,7 @@ class RNACentralFastaDataset(Dataset):
                         seq = seq.replace("T", "U")
 
                         if any(ch not in allowed for ch in seq):
-                            pass
+                            pass  # 丢弃
                         else:
                             self.headers.append(current_header)
                             self.sequences.append(seq)

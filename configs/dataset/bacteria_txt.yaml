@@ -1,7 +1,7 @@
-_name_: hg38
+_name_: hg38          # ✅ 这个已经是 hg38，保持不变
 
-bed_file: null
-fasta_file: null
+bed_file: null        # ✅ 补上这两行
+fasta_file: null      # ✅ 补上这两行
 
 dataset_name: bacteria_txt
 
