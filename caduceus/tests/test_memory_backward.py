@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 
@@ -12,7 +13,8 @@ def _assert_module_has_finite_nonzero_grad(module):
     assert sum(gradient.abs().sum() for gradient in gradients) > 0
 
 
-def test_memory_specific_gradients():
+@pytest.mark.parametrize("memory_implementation", ["lightweight", "full"])
+def test_memory_specific_gradients(memory_implementation):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(0)
 
@@ -25,6 +27,7 @@ def test_memory_specific_gradients():
         vocab_size=32,
         fused_add_norm=False,
         use_memory=True,
+        memory_implementation=memory_implementation,
         memory_d_sum=32,
         memory_d_mem=16,
         memory_n_heads=4,
@@ -50,7 +53,7 @@ def test_memory_specific_gradients():
     assert model.memory_read_gates.grad.abs().sum() > 0
 
     named = dict(model.memory_writer.named_parameters())
-    assert named["directional_fusion.write_score_mlp.0.weight"].grad.abs().sum() > 0
+    assert named["directional_fusion.write_score_head.weight"].grad.abs().sum() > 0
     assert named["summarizer.layer_embedding.weight"].grad.abs().sum() > 0
     assert named["summarizer.slot_type_embedding.weight"].grad.abs().sum() > 0
     assert named["summarizer.slot_position_embedding.weight"].grad.abs().sum() > 0
