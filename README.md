@@ -73,9 +73,12 @@ bash setup_linux_env.sh
 
 ## Pretraining
 
-Single GPU:
+Single GPU 100-epoch pretraining example:
 
 ```bash
+RUN_DIR=/absolute/path/runs/rna100_lightweight
+mkdir -p "$RUN_DIR"
+
 CUDA_VISIBLE_DEVICES=0 python -m train \
   experiment=hg38/hg38 \
   trainer.devices=1 \
@@ -91,7 +94,9 @@ CUDA_VISIBLE_DEVICES=0 python -m train \
   dataset.batch_size_eval=64 \
   dataset.mlm=true \
   dataset.mlm_probability=0.15 \
-  loader.num_workers=4 \
+  loader.num_workers=12 \
+  +loader.persistent_workers=true \
+  +loader.prefetch_factor=4 \
   model=caduceus \
   model.config.d_model=768 \
   model.config.n_layer=12 \
@@ -100,13 +105,19 @@ CUDA_VISIBLE_DEVICES=0 python -m train \
   model.config.bidirectional_strategy=add \
   model.config.bidirectional_weight_tie=true \
   model.config.rcps=false \
+  model.config.use_memory=true \
+  model.config.memory_d_sum=64 \
+  model.config.memory_d_mem=64 \
+  model.config.memory_write_stride=6 \
+  model.config.memory_read_stride=2 \
+  model.config.memory_persist_across_batches=false \
   model.config.pad_token_id=4 \
   optimizer.lr=8e-5 \
   optimizer.weight_decay=0.01 \
   'optimizer.betas=[0.9,0.98]' \
   trainer.precision=16 \
   trainer.gradient_clip_val=0.5 \
-  trainer.max_epochs=50 \
+  trainer.max_epochs=100 \
   trainer.max_steps=20000 \
   trainer.limit_val_batches=1.0 \
   +trainer.val_check_interval=1.0 \
@@ -116,10 +127,64 @@ CUDA_VISIBLE_DEVICES=0 python -m train \
   scheduler.warmup_t=4000 \
   scheduler.lr_min=2e-5 \
   scheduler.warmup_lr_init=1e-6 \
-  wandb=null
+  train.ckpt=null \
+  train.test=false \
+  train.monitor=val/loss \
+  train.mode=min \
+  wandb=null \
+  callbacks.model_checkpoint.monitor=val/loss \
+  callbacks.model_checkpoint.mode=min \
+  callbacks.model_checkpoint.dirpath="$RUN_DIR/checkpoints_best" \
+  callbacks.model_checkpoint.filename=val_loss \
+  callbacks.periodic_checkpoint.dirpath="$RUN_DIR/checkpoints_periodic" \
+  callbacks.model_checkpoint_every_n_steps.dirpath="$RUN_DIR/checkpoints" \
+  hydra.run.dir="$RUN_DIR/output"
 ```
 
 For two GPUs, use `CUDA_VISIBLE_DEVICES=0,1` and `trainer.devices=2`.
+
+## 100-epoch training report
+
+The following run was completed with commit `8e38ae4`.
+
+| Item | Setting |
+| --- | --- |
+| GPU | 1 x NVIDIA A100-PCIE-40GB |
+| Input sequences | 29,621 RNA sequences |
+| TXT sequences | 14,991 |
+| RNAcentral FASTA sequences | 14,630 |
+| Maximum sequence length | 1024 nt |
+| Tokenizer | Character-level tokenizer |
+| MLM probability | 0.15 |
+| Batch size | 16 |
+| Evaluation batch size | 64 |
+| Epochs | 100 |
+| Global steps | 9,300 |
+| Precision | FP16 |
+| Optimizer | AdamW |
+| Learning rate | 8e-5 |
+| Weight decay | 0.01 |
+| Adam betas | [0.9, 0.98] |
+| Gradient clipping | 0.5 |
+| Scheduler | Cosine warmup |
+| Warmup steps | 4,000 |
+| DataLoader workers | 12 |
+| Model dimension | 768 |
+| Number of layers | 12 |
+| Vocabulary size | 12 |
+| Bidirectional Mamba | Enabled |
+| Bidirectional strategy | Add |
+| Bidirectional weight tying | Enabled |
+| RCPS | Disabled |
+| Lightweight memory | Enabled |
+| Memory summary dimension | 64 |
+| Memory slot dimension | 64 |
+| Memory read stride | 2 |
+| Memory write stride | 6 |
+| Memory persistence across batches | Disabled |
+
+Training loss decreased from 1.29 at epoch 0 to 0.84 at epoch 99. The lowest
+displayed training loss during the run was 0.792 at epoch 79.
 
 ## Tests
 
@@ -132,3 +197,29 @@ python -m pytest -q caduceus/tests
 The suite checks MLM alignment, deterministic masking, memory isolation,
 read-before-write semantics, stride counts, padding-aware BCW, memory
 gradients, and model smoke behavior.
+
+## Reproducible environment setup
+
+The tested training environment used Linux, Python 3.10, PyTorch 2.2.x, CUDA 12.x compatible drivers, `mamba-ssm==1.2.2`, and `causal-conv1d==1.2.0.post2`.
+
+```bash
+conda create -n rna-mamba python=3.10 -y
+conda activate rna-mamba
+
+python -m pip install --upgrade pip setuptools wheel
+
+bash setup_linux_env.sh
+If downloading mamba-ssm from GitHub is slow, copy the prebuilt wheel to the server and install it manually:
+python -m pip install /path/to/mamba_ssm-1.2.2+cu122torch2.2cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+Verify the environment from the repository root:
+python - <<'PY'
+import torch
+import mamba_ssm
+
+print("torch:", torch.__version__)
+print("cuda available:", torch.cuda.is_available())
+print("gpu:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none")
+print("mamba_ssm:", mamba_ssm.__version__ if hasattr(mamba_ssm, "__version__") else "installed")
+PY
+
+python -m pytest -q caduceus/tests
