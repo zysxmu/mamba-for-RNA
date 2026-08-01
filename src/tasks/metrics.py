@@ -275,6 +275,21 @@ def mse(outs, y, len_batch=None):
         y_masked = torch.masked_select(y, mask)
         return F.mse_loss(outs_masked, y_masked)
 
+
+def smooth_l1(outs, y, len_batch=None, beta=1.0):
+    """Huber-style regression loss with the same shape handling as ``mse``."""
+    if len(y.shape) < len(outs.shape):
+        assert outs.shape[-1] == 1
+        outs = outs.squeeze(-1)
+    if len_batch is None:
+        return F.smooth_l1_loss(outs, y, beta=beta)
+    mask = torch.zeros_like(outs, dtype=torch.bool)
+    for i, length in enumerate(len_batch):
+        mask[i, :length, :] = 1
+    outs_masked = torch.masked_select(outs, mask)
+    y_masked = torch.masked_select(y, mask)
+    return F.smooth_l1_loss(outs_masked, y_masked, beta=beta)
+
 def forecast_rmse(outs, y, len_batch=None):
     # TODO: generalize, currently for Monash dataset
     return torch.sqrt(F.mse_loss(outs, y, reduction='none').mean(1)).mean()
@@ -336,6 +351,7 @@ output_metric_fns = {
     "eval_loss": loss,
     "mcc": mcc,
     "mse": mse,
+    "smooth_l1": smooth_l1,
     "mae": mae,
     "forecast_rmse": forecast_rmse,
     "f1_binary": f1_binary,
@@ -354,4 +370,3 @@ loss_metric_fns = {
     "ppl": ppl,
 }
 metric_fns = {**output_metric_fns, **loss_metric_fns}  # TODO py3.9
-

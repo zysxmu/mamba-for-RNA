@@ -71,6 +71,59 @@ The tested cluster environment uses Python 3.10, PyTorch 2.2, CUDA 12.x,
 bash setup_linux_env.sh
 ```
 
+## Human m6A sliding-window fine-tuning
+
+The human m6A task is a downstream fine-tuning task. It does not replace the
+mixed-RNA pretraining corpus. The preparation script maps each observed m6A
+context to one unique CDS position, removes repeated calls at the same
+transcript position, splits by gene before windowing, and converts `T` to `U`.
+
+Prepare the two supplied ZIP archives without extracting their multi-gigabyte
+members:
+
+```bash
+python scripts/prepare_human_m6a.py \
+  --cds-source /path/to/data-20260731T165030Z-1-001.zip \
+  --sites-source /path/to/data-20260731T165030Z-1-002.zip \
+  --output-dir data/processed/human_m6a \
+  --window-length 128 \
+  --stride 64
+```
+
+The output contains `train.jsonl`, `val.jsonl`, `test.jsonl`, and an auditable
+`stats.json`. Sequences are stored once per transcript; overlapping windows are
+created lazily by the dataloader. The primary target is the number of observed,
+uniquely mapped m6A sites in each window. Unlabelled adenosines are not claimed
+to be experimentally verified negatives.
+
+For the supplied archives, the audit found 10,240 transcripts and 293,367 m6A
+rows. A total of 266,514 sites (90.85%) mapped uniquely with a centred 41-nt or
+21-nt context. The default gene-level split produced 220,649 training, 27,881
+validation, and 26,978 test windows; approximately 79% contain at least one
+observed m6A site.
+
+Run a 500-window smoke fine-tune from the best MLM checkpoint:
+
+```bash
+python -m train \
+  experiment=human_m6a_window \
+  train.pretrained_model_path=/path/to/checkpoints_best/val_loss.ckpt \
+  train.pretrained_model_state_hook.freeze_backbone=true \
+  dataset.max_train_windows=500 \
+  dataset.max_val_windows=100 \
+  dataset.max_test_windows=100 \
+  trainer.max_epochs=3 \
+  wandb=null \
+  hydra.run.dir=outputs/human-m6a-smoke
+```
+
+After the smoke run and `stats.json` review, remove the three
+`max_*_windows` overrides and set
+`train.pretrained_model_state_hook.freeze_backbone=false` for complete
+fine-tuning. On an 8 GB RTX 4060, start with the configured batch size of 8 and
+reduce it to 4 if necessary. Increase `loader.num_workers` only on Linux after
+the first successful run.
+
 ## Pretraining
 
 Single GPU 100-epoch pretraining example:
@@ -192,6 +245,7 @@ Run tests from the repository root so the local package is importable:
 
 ```bash
 python -m pytest -q caduceus/tests
+python -m pytest -q tests/test_human_m6a_window.py
 ```
 
 The suite checks MLM alignment, deterministic masking, memory isolation,
