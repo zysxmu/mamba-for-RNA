@@ -124,6 +124,85 @@ fine-tuning. On an 8 GB RTX 4060, start with the configured batch size of 8 and
 reduce it to 4 if necessary. Increase `loader.num_workers` only on Linux after
 the first successful run.
 
+The supplied data converged after one complete full-parameter epoch. The best
+checkpoint produced train/validation/test MAE values of 0.845/0.840/0.853 and
+test MSE of 1.386 on 26,978 windows from 999 held-out genes. A constant
+two-sites-per-window baseline has test MAE 1.255 and MSE 2.531. Later epochs
+overfit, so checkpoint selection must remain based on validation loss.
+
+Evaluate a complete fine-tuned checkpoint without entering the fit loop:
+
+```bash
+python -m train \
+  experiment=human_m6a_window \
+  dataset.data_dir=/absolute/path/data/processed/human_m6a \
+  dataset.batch_size_eval=128 \
+  loader.num_workers=8 \
+  train.pretrained_model_path=null \
+  train.ckpt=/absolute/path/checkpoints/val/loss.ckpt \
+  train.eval_only=true \
+  trainer.devices=1 \
+  trainer.accelerator=gpu \
+  trainer.precision=16 \
+  wandb=null \
+  hydra.run.dir=outputs/human-m6a-test
+```
+
+`train.pretrained_model_state_hook` is a warm-start transformation only. Exact
+resume and test loading restore the complete checkpoint, including the
+fine-tuned regression head.
+
+### Sparse multi-site recovery
+
+The count model predicts how many observed m6A sites occur in each 128-nt
+window. Dense overlapping windows define an implicit measurement system
+`y = Wp`, where columns of `W` correspond only to adenosines and `p` contains
+non-negative sparse site scores. The recovery script solves a box-constrained
+non-negative L1 problem without materializing `W`.
+
+First verify identifiability using exact validation-window counts. This is an
+oracle geometry check, not a model result:
+
+```bash
+python scripts/reconstruct_m6a_sites.py \
+  --data-dir data/processed/human_m6a \
+  --split val \
+  --mode oracle \
+  --window-length 128 \
+  --stride 1 \
+  --l1-penalty 0.01 \
+  --output-dir outputs/m6a-cs-oracle-val
+```
+
+On the supplied validation split, dense stride-1 exact counts recover 99.99%
+of observed sites at `K = number of observed sites`, establishing that the
+window geometry is identifiable. It does not establish performance under
+noisy model-predicted counts.
+
+Next tune sparse recovery on validation predictions only. Start with a bounded
+50-transcript run before processing the full validation split:
+
+```bash
+python scripts/reconstruct_m6a_sites.py \
+  --data-dir data/processed/human_m6a \
+  --split val \
+  --mode model \
+  --checkpoint /absolute/path/checkpoints/val/loss.ckpt \
+  --window-length 128 \
+  --stride 1 \
+  --l1-penalty 0.1 \
+  --max-transcripts 50 \
+  --batch-size 128 \
+  --device cuda \
+  --output-dir outputs/m6a-cs-model-val
+```
+
+Choose stride, L1 penalty, and stopping rules using validation only. The script
+refuses to read `test.jsonl` unless `--allow-test` is supplied after those
+choices are frozen. Because unlabelled adenosines are unknown rather than
+verified negatives, site metrics are explicitly reported as recovery of
+observed calls, not biological specificity.
+
 ## Pretraining
 
 Single GPU 100-epoch pretraining example:
@@ -245,16 +324,37 @@ Run tests from the repository root so the local package is importable:
 
 ```bash
 python -m pytest -q caduceus/tests
-python -m pytest -q tests/test_human_m6a_window.py
+python -m pytest -q \
+  tests/test_human_m6a_window.py \
+  tests/test_m6a_sparse.py \
+  tests/test_checkpoint_and_collate_contracts.py
 ```
 
 The suite checks MLM alignment, deterministic masking, memory isolation,
 read-before-write semantics, stride counts, padding-aware BCW, memory
 gradients, and model smoke behavior.
 
+## Project structure
+
+```text
+caduceus/memory/writer.py  lightweight bidirectional memory writer
+caduceus/               model configuration and lightweight memory integration
+configs/                Hydra model, data, pipeline, and experiment settings
+src/dataloaders/        mixed-RNA and human-m6A loading and collation
+src/m6a_sparse.py       implicit window system and non-negative sparse solver
+scripts/                m6A preparation and sparse site-recovery entry points
+scripts/prepare_human_m6a.py  human m6A mapping and gene-level splitting
+src/callbacks/          runtime and validation logging
+slurm_scripts/          cluster submission scripts
+tests/fixtures/         synthetic smoke-test data
+train.py                training, exact resume/evaluation, and warm-start entry point
+```
+
 ## Reproducible environment setup
 
-The tested training environment used Linux, Python 3.10, PyTorch 2.2.x, CUDA 12.x compatible drivers, `mamba-ssm==1.2.2`, and `causal-conv1d==1.2.0.post2`.
+The tested training environment used Linux, Python 3.10, PyTorch 2.2.x, CUDA
+12.x compatible drivers, `mamba-ssm==1.2.2`, and
+`causal-conv1d==1.2.0.post2`.
 
 ```bash
 conda create -n rna-mamba python=3.10 -y
@@ -263,9 +363,18 @@ conda activate rna-mamba
 python -m pip install --upgrade pip setuptools wheel
 
 bash setup_linux_env.sh
-If downloading mamba-ssm from GitHub is slow, copy the prebuilt wheel to the server and install it manually:
+```
+
+If downloading `mamba-ssm` from GitHub is slow, copy the prebuilt wheel to the
+server and install it manually:
+
+```bash
 python -m pip install /path/to/mamba_ssm-1.2.2+cu122torch2.2cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+```
+
 Verify the environment from the repository root:
+
+```bash
 python - <<'PY'
 import torch
 import mamba_ssm
@@ -277,3 +386,4 @@ print("mamba_ssm:", mamba_ssm.__version__ if hasattr(mamba_ssm, "__version__") e
 PY
 
 python -m pytest -q caduceus/tests
+```

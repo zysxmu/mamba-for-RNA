@@ -240,19 +240,78 @@ class SequenceLightningModule(pl.LightningModule):
         self.test_torchmetrics = self.task.test_torchmetrics
 
     def load_state_dict(self, state_dict, strict=False):
-        if self.hparams.train.pretrained_model_state_hook['_name_'] is not None:
-            model_state_hook = utils.instantiate(
-                registry.model_state_hook,
-                self.hparams.train.pretrained_model_state_hook.copy(),
-                partial=True,
-            )
-            state_dict = model_state_hook(self.model, state_dict)
-
         log.info("Custom load_state_dict function is running.")
 
-        # strict==True will require all modules to match
-        # strict==False can allow encoder/decoder to be loaded from scratch too
+        # Exact Lightning resume/test loading must restore the complete module,
+        # including downstream encoders and decoders.  Pretrained-model hooks
+        # deliberately discard task-specific heads, so they are applied only
+        # in load_compatible_pretrained() below and never in this generic
+        # state-dict entry point.
         return super().load_state_dict(state_dict, strict=strict)
+
+    def load_compatible_pretrained(self, checkpoint_path):
+        """Warm-start from keys whose names and shapes match this model.
+
+        This is intentionally separate from Lightning resume. Resume must use
+        ``train.ckpt`` and restores the exact model, optimizer, scheduler, and
+        global step. This method initializes a new architecture from a baseline
+        checkpoint and never silently accepts shape mismatches.
+        """
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        source_state = checkpoint.get("state_dict", checkpoint)
+
+        hook_config = self.hparams.train.get("pretrained_model_state_hook", None)
+        if hook_config is not None and hook_config.get("_name_", None) is not None:
+            model_state_hook = utils.instantiate(
+                registry.model_state_hook,
+                hook_config.copy(),
+                partial=True,
+            )
+            # Hooks such as load_backbone are warm-start transformations: they
+            # map an MLM checkpoint onto a downstream backbone and intentionally
+            # leave the new task head at its initialization.
+            source_state = model_state_hook(self.model, dict(source_state))
+
+        current_state = self.state_dict()
+
+        compatible = {}
+        unexpected = []
+        shape_mismatches = {}
+        for name, value in source_state.items():
+            if name not in current_state:
+                unexpected.append(name)
+            elif current_state[name].shape != value.shape:
+                shape_mismatches[name] = {
+                    "checkpoint": list(value.shape),
+                    "model": list(current_state[name].shape),
+                }
+            else:
+                compatible[name] = value
+
+        missing = sorted(set(current_state) - set(compatible))
+        result = self.load_state_dict(compatible, strict=False)
+
+        backbone_keys = [
+            name
+            for name in current_state
+            if name.startswith("model.") and "memory_" not in name
+        ]
+        loaded_backbone = sum(
+            current_state[name].numel() for name in backbone_keys if name in compatible
+        )
+        total_backbone = sum(current_state[name].numel() for name in backbone_keys)
+        backbone_ratio = loaded_backbone / max(1, total_backbone)
+
+        report = {
+            "checkpoint": str(checkpoint_path),
+            "loaded_keys": len(compatible),
+            "missing_keys": missing,
+            "unexpected_keys": sorted(unexpected),
+            "shape_mismatches": shape_mismatches,
+            "backbone_parameter_ratio": backbone_ratio,
+        }
+        log.info("Compatible warm-start report:\n%s", json.dumps(report, indent=2))
+        return result, report
 
     def _check_config(self):
         assert self.hparams.train.state.mode in [None, "none", "null", "reset", "bptt", "tbptt"]
@@ -733,13 +792,33 @@ def train(config):
     trainer = create_trainer(config)
     model = SequenceLightningModule(config)
 
-    # Load pretrained_model if specified
+    if config.train.get("eval_only", False):
+        checkpoint_path = config.train.get("ckpt", None)
+        if checkpoint_path is None or not fsspec_exists(checkpoint_path):
+            raise FileNotFoundError(
+                "train.eval_only=true requires train.ckpt to reference a complete checkpoint"
+            )
+        if config.train.get("pretrained_model_path", None) is not None:
+            raise ValueError(
+                "Do not combine train.eval_only=true with train.pretrained_model_path; "
+                "train.ckpt already contains the complete fine-tuned module."
+            )
+        log.info(f"Running TEST-only evaluation using ckpt: {checkpoint_path}")
+        trainer.test(model, ckpt_path=checkpoint_path)
+        return
+
+    # A pretrained model is an initialization source, not an exact resume.
+    # Exact resume is handled by trainer.fit(..., ckpt_path=train.ckpt).
     if config.train.get("pretrained_model_path", None) is not None:
-        model = SequenceLightningModule.load_from_checkpoint(
-            config.train.pretrained_model_path,
-            config=config,
-            strict=config.train.pretrained_model_strict_load,
-        )
+        if config.train.pretrained_model_strict_load:
+            checkpoint = torch.load(
+                config.train.pretrained_model_path,
+                map_location="cpu",
+            )
+            state_dict = checkpoint.get("state_dict", checkpoint)
+            model.load_state_dict(state_dict, strict=True)
+        else:
+            model.load_compatible_pretrained(config.train.pretrained_model_path)
 
     # Optional validation before training
     if config.train.validate_at_start:

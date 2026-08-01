@@ -22,6 +22,7 @@ train:
   mode: ??? # Should be specified by pipeline. Used by scheduler (plateau) and checkpointer
   ema: 0.0 # Moving average model for validation
   test: True # Test after training
+  eval_only: False # Load train.ckpt and run the true test split without fitting
   debug: False # Special settings to make debugging more convenient
   ignore_warnings: False # Disable python warnings
 

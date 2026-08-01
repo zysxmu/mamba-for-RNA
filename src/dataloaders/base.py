@@ -56,8 +56,14 @@ class DefaultCollateMixin:
                 # If we're in a background process, concatenate directly into a
                 # shared memory tensor to avoid an extra copy
                 numel = sum(x.numel() for x in batch)
-                storage = elem.storage()._new_shared(numel)
-                out = elem.new(storage)
+                storage = elem._typed_storage()._new_shared(
+                    numel,
+                    device=elem.device,
+                )
+                # torch.stack no longer resizes a non-empty ``out`` tensor.
+                # Give the shared tensor its final shape up front, matching
+                # PyTorch's current default_collate implementation.
+                out = elem.new(storage).resize_(len(batch), *elem.size())
             x = torch.stack(batch, dim=0, out=out)
 
             # Insert custom functionality into the collate_fn
