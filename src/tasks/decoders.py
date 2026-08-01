@@ -96,16 +96,21 @@ class SequenceDecoder(Decoder):
         elif self.mode == "pool":
             def restrict(x_seq):
                 """Pool sequence over a certain range"""
-                L = x_seq.size(1)
-                s = x_seq.sum(dim=1, keepdim=True)
+                # Sequence is always the penultimate dimension for both
+                # batched [B, L, D] and per-sample [L, D] tensors.  The latter
+                # is used when valid lengths exclude right padding.
+                L = x_seq.size(-2)
+                s = x_seq.sum(dim=-2, keepdim=True)
                 if l_output > 1:
-                    c = torch.cumsum(x_seq[..., -(l_output - 1):, ...].flip(1), dim=1)
+                    c = torch.cumsum(
+                        x_seq[..., -(l_output - 1):, :].flip(-2), dim=-2
+                    )
                     c = F.pad(c, (0, 0, 1, 0))
                     s = s - c  # (B, l_output, D)
-                    s = s.flip(1)
+                    s = s.flip(-2)
                 denom = torch.arange(
                     L - l_output + 1, L + 1, dtype=x_seq.dtype, device=x_seq.device
-                )
+                ).unsqueeze(-1)
                 s = s / denom
                 return s
 

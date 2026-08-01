@@ -7,21 +7,21 @@ from functools import partial
 
 import torch
 import torch.nn as nn
-from flash_attn.utils.generation import GenerationMixin
 from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.models.mixer_seq_simple import MixerModel
 from mamba_ssm.models.mixer_seq_simple import _init_weights as _init_weights_mamba
 
 try:
-    from flash_attn.ops.fused_dense import ColumnParallelLinear
+    from flash_attn.utils.generation import GenerationMixin
 except ImportError:
-    ColumnParallelLinear = None
+    class GenerationMixin:
+        """Fallback for embedding-only models when FlashAttention is absent."""
+
+        pass
 
 
 from caduceus.configuration_caduceus import CaduceusConfig
 from caduceus.modeling_caduceus import Caduceus
-from src.models.sequence.long_conv_lm import LMBackbone
-from src.models.sequence.long_conv_lm import _init_weights
 
 
 class DNAEmbeddingModel(nn.Module, GenerationMixin):
@@ -43,6 +43,18 @@ class DNAEmbeddingModel(nn.Module, GenerationMixin):
                  fused_mlp=False, fused_dropout_add_ln=False, residual_in_fp32=False,
                  pad_vocab_size_multiple: int = 1, sequence_parallel=True,
                  device=None, dtype=None, return_hidden_state=False, **kwargs) -> None:
+        # The generic long-convolution backbone depends on FlashAttention, but
+        # the Mamba and Caduceus embedding subclasses below do not.  Keep this
+        # import local so those subclasses remain usable without flash-attn.
+        try:
+            from src.models.sequence.long_conv_lm import LMBackbone
+            from src.models.sequence.long_conv_lm import _init_weights
+        except ImportError as exc:
+            raise ImportError(
+                "DNAEmbeddingModel requires the optional flash-attn dependency; "
+                "DNAEmbeddingModelMamba and DNAEmbeddingModelCaduceus do not."
+            ) from exc
+
         factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__()
         self.d_model = d_model  # for decoder
