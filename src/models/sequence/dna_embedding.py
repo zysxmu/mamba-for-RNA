@@ -91,7 +91,9 @@ class DNAEmbeddingModel(nn.Module, GenerationMixin):
         self.apply(partial(_init_weights, n_layer=n_layer,
                            **(initializer_cfg if initializer_cfg is not None else {})))
 
-    def forward(self, input_ids, position_ids=None, inference_params=None, state=None):  # state for the repo interface
+    def forward(
+        self, input_ids, position_ids=None, inference_params=None, state=None, **batch_metadata
+    ):  # state and batch metadata are part of the repo interface
         """DNA Embedding Model forward pass."""
         hidden_states = self.backbone(input_ids, position_ids=position_ids,
                                       inference_params=inference_params)
@@ -158,7 +160,9 @@ class DNAEmbeddingModelMamba(DNAEmbeddingModel):
         self.conjoin_train = conjoin_train
         self.conjoin_test = conjoin_test
 
-    def forward(self, input_ids, position_ids=None, inference_params=None, state=None):  # state for the repo interface
+    def forward(
+        self, input_ids, position_ids=None, inference_params=None, state=None, **batch_metadata
+    ):  # state and batch metadata are part of the repo interface
         """Mamba backbone-specific forward pass that does not use `position_ids`."""
         hidden_states = self.backbone(input_ids, inference_params=inference_params)
         # we only need the last hidden state for embeddings (decoder head will predict classification task)
@@ -188,8 +192,10 @@ class DNAEmbeddingModelCaduceus(DNAEmbeddingModel):
         self.conjoin_train = conjoin_train
         self.conjoin_test = conjoin_test
 
-    def forward(self, input_ids, position_ids=None, inference_params=None, state=None):  # state for the repo interface
-        """Caduceus backbone-specific forward pass that does not use `position_ids`."""
+    def forward(
+        self, input_ids, position_ids=None, inference_params=None, state=None, **batch_metadata
+    ):  # state and batch metadata are part of the repo interface
+        """Caduceus forward pass; downstream metadata is consumed by the decoder."""
         if self.config.rcps:  # Hidden states have 2 * d_model channels for RCPS
             hidden_states = self.caduceus(input_ids, return_dict=False)
             num_chan = hidden_states.shape[-1]
