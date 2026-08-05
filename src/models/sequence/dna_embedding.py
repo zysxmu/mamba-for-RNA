@@ -271,3 +271,27 @@ def load_backbone(model, state_dict, freeze_backbone=False, ignore_head=True):
 
     # we have updated the new model state dict with pretrained now
     return updated_model_state_dict
+
+
+def load_matching_backbone(model, state_dict, freeze_backbone=False):
+    """Warm-start only shape-compatible backbone tensors.
+
+    Unlike ``load_backbone``, this hook intentionally tolerates changed memory
+    stride/capacity settings and never copies a downstream decoder whose shape
+    happens to match the new task head.
+    """
+
+    torch.nn.modules.utils.consume_prefix_in_state_dict_if_present(state_dict, "model.")
+    current = model.state_dict()
+    updated = {}
+    for key, value in current.items():
+        loaded = state_dict.get(key)
+        if loaded is not None and loaded.shape == value.shape:
+            updated[f"model.{key}"] = loaded
+
+    if not updated:
+        raise ValueError("No shape-compatible backbone tensors were found in the checkpoint")
+    if freeze_backbone:
+        for parameter in model.parameters():
+            parameter.requires_grad = False
+    return updated

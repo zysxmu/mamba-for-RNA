@@ -63,6 +63,32 @@ def test_warm_start_hook_still_leaves_downstream_head_fresh(tmp_path):
         assert torch.equal(value, original_decoder[name])
 
 
+def test_matching_backbone_hook_ignores_same_shaped_decoder(tmp_path):
+    module = _tiny_lightning_module()
+    module.hparams.train.pretrained_model_state_hook._name_ = "load_matching_backbone"
+    original_decoder = {
+        name: value.detach().clone()
+        for name, value in module.decoder.state_dict().items()
+    }
+    checkpoint_path = tmp_path / "downstream.ckpt"
+    torch.save(
+        {
+            "state_dict": {
+                "model.weight": torch.full_like(module.model.weight, 5.0),
+                "model.bias": torch.full_like(module.model.bias, 6.0),
+                "decoder.weight": torch.full_like(module.decoder.weight, 7.0),
+                "decoder.bias": torch.full_like(module.decoder.bias, 8.0),
+            }
+        },
+        checkpoint_path,
+    )
+    module.load_compatible_pretrained(checkpoint_path)
+    assert torch.equal(module.model.weight, torch.full_like(module.model.weight, 5.0))
+    assert torch.equal(module.model.bias, torch.full_like(module.model.bias, 6.0))
+    for name, value in module.decoder.state_dict().items():
+        assert torch.equal(value, original_decoder[name])
+
+
 def test_worker_collate_preallocates_final_output_shape(monkeypatch):
     monkeypatch.setattr(torch.utils.data, "get_worker_info", lambda: object())
     batch = (torch.arange(4), torch.arange(4) + 10)

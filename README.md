@@ -275,6 +275,92 @@ CUDA_VISIBLE_DEVICES=0 python -m train \
 
 For two GPUs, use `CUDA_VISIBLE_DEVICES=0,1` and `trainer.devices=2`.
 
+## Nucleotide-level human m6A fine-tuning
+
+The full-mRNA task uses `transcript_sequence` as input and the equally long
+`m6a_nt_mask` as its target. A labelled adenosine is `1`, an unmethylated
+adenosine is `0`, and non-A bases are excluded from the loss. Overlapping
+windows provide boundary context, while non-overlapping ownership intervals
+ensure that each A contributes to the loss once per epoch. Splits are made by
+gene rather than by window or transcript isoform.
+
+Prepare and audit the three source tables:
+
+```bash
+cd /home/zys/mamba-for-RNA
+conda activate rna-mamba
+
+SOURCE_DIR=/home/zys/gpt
+M6A_NT_DATA_DIR=/home/zys/mamba-for-RNA/data/processed/human_m6a_nucleotide
+mkdir -p "$M6A_NT_DATA_DIR"
+
+python scripts/prepare_m6a_nucleotide.py \
+  --transcript-master "$SOURCE_DIR/transcript_master.csv.gz" \
+  --mask-table "$SOURCE_DIR/m6a_nt_mask_full_mrna.csv.gz" \
+  --exon-map "$SOURCE_DIR/exon_coordinate_map.csv.gz" \
+  --output-dir "$M6A_NT_DATA_DIR" \
+  | tee "$M6A_NT_DATA_DIR/prepare.log"
+
+cat "$M6A_NT_DATA_DIR/stats.json"
+```
+
+The processed files retain all records. Formal training excludes rows with
+`mrna_coordinate_system_reliable=false` by default; set
+`dataset.require_mrna_coordinate_reliable=false` only for an explicit
+all-records ablation.
+
+Run a one-epoch integration smoke test before the full job. The warm-start
+hook loads only shape-compatible backbone tensors and deliberately leaves the
+new nucleotide classifier randomly initialized.
+
+```bash
+export M6A_NT_DATA_DIR=/home/zys/mamba-for-RNA/data/processed/human_m6a_nucleotide
+PRETRAINED_CKPT=/home/zys/mamba-for-RNA/runs/human_m6a_full_finetune/checkpoints/val/loss.ckpt
+RUN_DIR=/home/zys/mamba-for-RNA/runs/human_m6a_nucleotide_smoke
+
+CUDA_VISIBLE_DEVICES=0 python -m train \
+  experiment=human_m6a_nucleotide \
+  train.pretrained_model_path="$PRETRAINED_CKPT" \
+  dataset.max_train_windows=64 \
+  dataset.max_val_windows=32 \
+  dataset.max_test_windows=32 \
+  dataset.batch_size=2 \
+  dataset.batch_size_eval=4 \
+  loader.num_workers=4 \
+  trainer.max_epochs=1 \
+  trainer.accumulate_grad_batches=1 \
+  wandb=null \
+  hydra.run.dir="$RUN_DIR"
+```
+
+After the smoke test succeeds, launch the complete single-GPU fine-tuning run:
+
+```bash
+export M6A_NT_DATA_DIR=/home/zys/mamba-for-RNA/data/processed/human_m6a_nucleotide
+PRETRAINED_CKPT=/home/zys/mamba-for-RNA/runs/human_m6a_full_finetune/checkpoints/val/loss.ckpt
+RUN_DIR=/home/zys/mamba-for-RNA/runs/human_m6a_nucleotide_full
+mkdir -p "$RUN_DIR"
+
+CUDA_VISIBLE_DEVICES=0 /usr/bin/time -v -o "$RUN_DIR/time.txt" \
+python -m train \
+  experiment=human_m6a_nucleotide \
+  train.pretrained_model_path="$PRETRAINED_CKPT" \
+  dataset.batch_size=8 \
+  dataset.batch_size_eval=16 \
+  loader.num_workers=8 \
+  trainer.max_epochs=10 \
+  wandb=null \
+  hydra.run.dir="$RUN_DIR" \
+  2>&1 | tee "$RUN_DIR/console.log"
+```
+
+Checkpoint selection uses validation average precision, which is more
+informative than raw accuracy for the approximately 4.3% positive A sites.
+The run also reports AUROC, precision, recall, F1, accuracy, and the observed
+positive rate on A candidates. The ranking metrics use a distributed
+fixed-memory histogram, so evaluation does not retain millions of site scores
+in GPU memory.
+
 ## 100-epoch training report
 
 The following run was completed with commit `8e38ae4`.
@@ -326,6 +412,7 @@ Run tests from the repository root so the local package is importable:
 python -m pytest -q caduceus/tests
 python -m pytest -q \
   tests/test_human_m6a_window.py \
+  tests/test_m6a_nucleotide.py \
   tests/test_m6a_sparse.py \
   tests/test_checkpoint_and_collate_contracts.py
 ```
@@ -344,6 +431,7 @@ src/dataloaders/        mixed-RNA and human-m6A loading and collation
 src/m6a_sparse.py       implicit window system and non-negative sparse solver
 scripts/                m6A preparation and sparse site-recovery entry points
 scripts/prepare_human_m6a.py  human m6A mapping and gene-level splitting
+scripts/prepare_m6a_nucleotide.py  full-mRNA mask validation and gene splitting
 src/callbacks/          runtime and validation logging
 slurm_scripts/          cluster submission scripts
 tests/fixtures/         synthetic smoke-test data
