@@ -1,6 +1,8 @@
 """Caduceus model for Hugging Face.
 
 """
+from __future__ import annotations
+
 from caduceus.memory_pool import MemoryPool
 from caduceus.memory_cross_attn import MemoryCrossAttention
 from .memory.writer import BidirectionalMemoryWriter
@@ -95,6 +97,51 @@ def _get_bimamba_from_layer(layer):
     return None
 
 
+def _valid_prefix_reverse_indices(attention_mask, validate=False):
+    """Build the self-inverse gather indices for right-padded sequences."""
+
+    mask = attention_mask.to(dtype=torch.bool)
+    positions = torch.arange(mask.shape[1], device=mask.device)
+    lengths = mask.sum(dim=1)
+    expected = positions.unsqueeze(0) < lengths.unsqueeze(1)
+    if validate and not torch.equal(mask, expected):
+        raise ValueError("BiMamba requires attention_mask to be a contiguous valid prefix")
+    return torch.where(
+        expected,
+        lengths.unsqueeze(1) - 1 - positions.unsqueeze(0),
+        positions.unsqueeze(0),
+    )
+
+
+def _reverse_valid_prefix(
+    hidden_states,
+    attention_mask,
+    reverse_indices=None,
+    validate=False,
+):
+    """Reverse only each sample's contiguous non-PAD prefix.
+
+    A plain sequence flip moves right padding in front of the biological
+    sequence and contaminates the reverse Mamba state. This gather is
+    self-inverse: applying it before and after the reverse mixer restores the
+    original right-padded layout without allowing PAD tokens to precede valid
+    nucleotides.
+    """
+
+    if attention_mask is None:
+        return hidden_states.flip(dims=(1,))
+    if attention_mask.ndim != 2 or attention_mask.shape != hidden_states.shape[:2]:
+        raise ValueError(
+            "attention_mask must have shape [batch, length] matching hidden_states"
+        )
+    if reverse_indices is None:
+        reverse_indices = _valid_prefix_reverse_indices(
+            attention_mask.to(device=hidden_states.device), validate=validate
+        )
+    gather_indices = reverse_indices.unsqueeze(-1).expand_as(hidden_states)
+    return hidden_states.gather(1, gather_indices)
+
+
 class BiMambaWrapper(nn.Module):
     def __init__(
             self,
@@ -131,6 +178,8 @@ class BiMambaWrapper(nn.Module):
         # 缓存两路输出给 memory sidecar
         self.last_fwd = None
         self.last_bwd = None
+        self.attention_mask = None
+        self.reverse_indices = None
 
     def forward(self, hidden_states, inference_params=None):
         out_fwd = self.mamba_fwd(
@@ -141,10 +190,16 @@ class BiMambaWrapper(nn.Module):
         out_rev = None
 
         if self.bidirectional:
+            reversed_states = _reverse_valid_prefix(
+                hidden_states, self.attention_mask, self.reverse_indices
+            )
             out_rev = self.mamba_rev(
-                hidden_states.flip(dims=(1,)),
+                reversed_states,
                 inference_params=inference_params,
-            ).flip(dims=(1,))
+            )
+            out_rev = _reverse_valid_prefix(
+                out_rev, self.attention_mask, self.reverse_indices
+            )
 
             if self.bidirectional_strategy == "add":
                 out = out_fwd + out_rev
@@ -299,6 +354,11 @@ class CaduceusMixerModel(nn.Module):
             pad_token_id = getattr(self.config, "pad_token_id", None)
             if pad_token_id is not None:
                 attention_mask = input_ids.ne(pad_token_id)
+        reverse_indices = (
+            _valid_prefix_reverse_indices(attention_mask)
+            if attention_mask is not None
+            else None
+        )
 
         residual = None
 
@@ -317,6 +377,10 @@ class CaduceusMixerModel(nn.Module):
             if output_hidden_states:
                 all_hidden_states.append(hidden_states)
 
+            bim = _get_bimamba_from_layer(layer)
+            if bim is not None:
+                bim.attention_mask = attention_mask
+                bim.reverse_indices = reverse_indices
             hidden_states, residual = layer(hidden_states, residual, inference_params=None)
 
             if self.use_memory:

@@ -1,5 +1,7 @@
 """Lightweight bidirectional-consistent memory writing."""
 
+from __future__ import annotations
+
 import torch
 from torch import nn
 

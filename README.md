@@ -279,10 +279,11 @@ For two GPUs, use `CUDA_VISIBLE_DEVICES=0,1` and `trainer.devices=2`.
 
 The full-mRNA task uses `transcript_sequence` as input and the equally long
 `m6a_nt_mask` as its target. A labelled adenosine is `1`, an unmethylated
-adenosine is `0`, and non-A bases are excluded from the loss. Overlapping
-windows provide boundary context, while non-overlapping ownership intervals
-ensure that each A contributes to the loss once per epoch. Splits are made by
-gene rather than by window or transcript isoform.
+adenosine is `0`, and non-A bases are excluded from the loss. Preparation now
+verifies the strict 0-based, half-open contract
+`transcript_sequence == 5'UTR + CDS + 3'UTR`, including CDS start/end and
+sequence-derived start/stop-codon flags. Splits are made by gene rather than by
+window or transcript isoform.
 
 Prepare and audit the three source tables:
 
@@ -304,10 +305,81 @@ python scripts/prepare_m6a_nucleotide.py \
 cat "$M6A_NT_DATA_DIR/stats.json"
 ```
 
-The processed files retain all records. Formal training excludes rows with
-`mrna_coordinate_system_reliable=false` by default; set
-`dataset.require_mrna_coordinate_reliable=false` only for an explicit
-all-records ablation.
+The processed files retain all records and region boundaries. Recommended
+full-transcript training requires both `mrna_coordinate_system_reliable=true`
+and `cds_boundary_reliable=true`. The legacy 1024-nt window experiment remains
+available as `experiment=human_m6a_nucleotide` for controlled comparisons.
+
+### Complete-transcript long-context training
+
+`experiment=human_m6a_full_transcript` treats one complete
+`5'UTR + CDS + 3'UTR` sequence as one item. It does not split a transcript by
+region or silently truncate it. The default 10,240-nt cap retains approximately
+98% of coordinate-reliable labelled transcripts; excluded longer transcripts
+are counted in the startup audit. Batches use dynamic right padding, and the
+padding-aware BiMamba reverse path reverses only each sample's valid prefix.
+
+First benchmark 100 optimizer steps on the A100 80GB GPU:
+
+```bash
+export M6A_NT_DATA_DIR=/home/zys/mamba-for-RNA/data/processed/human_m6a_nucleotide
+NT_CKPT=/home/zys/mamba-for-RNA/runs/human_m6a_nucleotide_full_retry/checkpoints/val/m6a_average_precision.ckpt
+RUN_DIR=/home/zys/mamba-for-RNA/runs/human_m6a_full_10240_benchmark
+mkdir -p "$RUN_DIR"
+
+CUDA_VISIBLE_DEVICES=0 /usr/bin/time -v -o "$RUN_DIR/time.txt" \
+python -m train \
+  experiment=human_m6a_full_transcript \
+  train.pretrained_model_path="$NT_CKPT" \
+  train.pretrained_model_strict_load=true \
+  dataset.max_sequence_length=10240 \
+  dataset.max_train_transcripts=512 \
+  dataset.max_val_transcripts=64 \
+  dataset.max_test_transcripts=64 \
+  dataset.batch_size=1 \
+  dataset.batch_size_eval=1 \
+  loader.num_workers=8 \
+  trainer.max_epochs=1 \
+  +trainer.max_steps=100 \
+  trainer.accumulate_grad_batches=1 \
+  trainer.limit_val_batches=0 \
+  train.test=false \
+  wandb=null \
+  hydra.run.dir="$RUN_DIR" \
+  2>&1 | tee "$RUN_DIR/console.log"
+```
+
+If the benchmark is stable, run the complete job. This preserves the existing
+nucleotide-level classifier and fine-tunes all model parameters on complete
+transcripts:
+
+```bash
+export M6A_NT_DATA_DIR=/home/zys/mamba-for-RNA/data/processed/human_m6a_nucleotide
+NT_CKPT=/home/zys/mamba-for-RNA/runs/human_m6a_nucleotide_full_retry/checkpoints/val/m6a_average_precision.ckpt
+RUN_DIR=/home/zys/mamba-for-RNA/runs/human_m6a_full_10240
+mkdir -p "$RUN_DIR"
+
+CUDA_VISIBLE_DEVICES=0 /usr/bin/time -v -o "$RUN_DIR/time.txt" \
+python -m train \
+  experiment=human_m6a_full_transcript \
+  train.pretrained_model_path="$NT_CKPT" \
+  train.pretrained_model_strict_load=true \
+  dataset.max_sequence_length=10240 \
+  dataset.batch_size=1 \
+  dataset.batch_size_eval=1 \
+  loader.num_workers=8 \
+  trainer.max_epochs=5 \
+  trainer.accumulate_grad_batches=16 \
+  wandb=null \
+  hydra.run.dir="$RUN_DIR" \
+  2>&1 | tee "$RUN_DIR/console.log"
+```
+
+Do not set `train.ckpt` to the old window checkpoint: that is an exact resume
+and would also restore its optimizer and epoch state. Use
+`train.pretrained_model_path` as shown above for a new long-context run.
+
+### Legacy 1024-nt window baseline
 
 Run a one-epoch integration smoke test before the full job. The warm-start
 hook loads only shape-compatible backbone tensors and deliberately leaves the
@@ -411,6 +483,7 @@ Run tests from the repository root so the local package is importable:
 ```bash
 python -m pytest -q caduceus/tests
 python -m pytest -q \
+  caduceus/tests/test_padding_aware_bimamba.py \
   tests/test_human_m6a_window.py \
   tests/test_m6a_nucleotide.py \
   tests/test_m6a_sparse.py \

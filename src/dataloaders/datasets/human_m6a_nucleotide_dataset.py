@@ -1,4 +1,4 @@
-"""Overlapping full-mRNA windows for nucleotide-level m6A classification."""
+"""Full-mRNA datasets for nucleotide-level m6A classification."""
 
 from __future__ import annotations
 
@@ -12,6 +12,41 @@ import numpy as np
 import torch
 
 IGNORE_INDEX = -100.0
+
+
+def collate_full_transcripts(
+    batch,
+    pad_token_id: int,
+    pad_to_multiple: int = 8,
+):
+    """Dynamically right-pad complete transcripts and return model metadata."""
+
+    if not batch:
+        raise ValueError("Cannot collate an empty batch")
+    if pad_to_multiple <= 0:
+        raise ValueError("pad_to_multiple must be positive")
+    input_items, label_items = zip(*batch)
+    lengths = torch.tensor([item.numel() for item in input_items], dtype=torch.long)
+    padded_length = int(lengths.max().item())
+    remainder = padded_length % int(pad_to_multiple)
+    if remainder:
+        padded_length += int(pad_to_multiple) - remainder
+
+    input_ids = torch.full(
+        (len(batch), padded_length), int(pad_token_id), dtype=torch.long
+    )
+    labels = torch.full(
+        (len(batch), padded_length), float(IGNORE_INDEX), dtype=torch.float32
+    )
+    attention_mask = torch.zeros((len(batch), padded_length), dtype=torch.bool)
+    for row, (item, target) in enumerate(zip(input_items, label_items)):
+        length = item.numel()
+        if target.numel() != length:
+            raise ValueError("Input and target lengths must match")
+        input_ids[row, :length] = item
+        labels[row, :length] = target
+        attention_mask[row, :length] = True
+    return input_ids, labels, {"attention_mask": attention_mask, "lengths": lengths}
 
 
 def window_starts(sequence_length: int, window_length: int, stride: int) -> List[int]:
@@ -199,4 +234,149 @@ class HumanM6ANucleotideDataset(torch.utils.data.Dataset):
         for position in positions[left:right]:
             labels[int(position) - start] = 1.0
 
+        return input_ids, labels
+
+
+class HumanM6AFullTranscriptDataset(torch.utils.data.Dataset):
+    """Return one complete, untruncated mRNA per item.
+
+    Transcripts longer than ``max_sequence_length`` are excluded or rejected;
+    they are never silently truncated. Padding is deferred to the data-module
+    collator so every item retains its true biological length.
+    """
+
+    REQUIRED_REGION_FIELDS = {
+        "utr5_start",
+        "utr5_end",
+        "cds_start",
+        "cds_end",
+        "utr3_start",
+        "utr3_end",
+        "cds_boundary_reliable",
+    }
+
+    def __init__(
+        self,
+        jsonl_file,
+        tokenizer,
+        max_sequence_length: Optional[int] = 10240,
+        overlength_policy: str = "exclude",
+        require_mrna_coordinate_reliable: bool = True,
+        require_cds_boundary_reliable: bool = True,
+        max_transcripts: Optional[int] = None,
+    ):
+        self.jsonl_file = Path(jsonl_file)
+        self.tokenizer = tokenizer
+        self.max_sequence_length = (
+            None if max_sequence_length is None else int(max_sequence_length)
+        )
+        self.max_length = self.max_sequence_length
+        self.overlength_policy = str(overlength_policy).lower()
+        self.require_mrna_coordinate_reliable = bool(require_mrna_coordinate_reliable)
+        self.require_cds_boundary_reliable = bool(require_cds_boundary_reliable)
+        if self.max_sequence_length is not None and self.max_sequence_length <= 0:
+            raise ValueError("max_sequence_length must be positive or null")
+        if self.overlength_policy not in {"exclude", "error"}:
+            raise ValueError("overlength_policy must be 'exclude' or 'error'")
+
+        self.records: List[Mapping[str, object]] = []
+        self.excluded_overlength = 0
+        self.excluded_unreliable_mrna = 0
+        self.excluded_unreliable_cds = 0
+        opener = gzip.open if self.jsonl_file.suffix == ".gz" else open
+        with opener(self.jsonl_file, "rt", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                self._validate_record(record, line_number)
+                if self.require_mrna_coordinate_reliable and not bool(
+                    record["mrna_coordinate_system_reliable"]
+                ):
+                    self.excluded_unreliable_mrna += 1
+                    continue
+                if self.require_cds_boundary_reliable and not bool(
+                    record["cds_boundary_reliable"]
+                ):
+                    self.excluded_unreliable_cds += 1
+                    continue
+                sequence_length = len(str(record["sequence"]))
+                if (
+                    self.max_sequence_length is not None
+                    and sequence_length > self.max_sequence_length
+                ):
+                    if self.overlength_policy == "error":
+                        raise ValueError(
+                            f"Line {line_number} transcript {record['transcript_id']} has length "
+                            f"{sequence_length} > max_sequence_length={self.max_sequence_length}"
+                        )
+                    self.excluded_overlength += 1
+                    continue
+                if "A" not in str(record["sequence"]):
+                    continue
+                self.records.append(record)
+                if max_transcripts is not None and len(self.records) >= int(max_transcripts):
+                    break
+
+        self.sequence_lengths = [len(str(record["sequence"])) for record in self.records]
+        self.candidate_count = sum(str(record["sequence"]).count("A") for record in self.records)
+        self.positive_count = sum(len(record["m6a_positions"]) for record in self.records)
+        self.negative_count = self.candidate_count - self.positive_count
+        self.positive_weight = self.negative_count / max(1, self.positive_count)
+
+        vocab = tokenizer.get_vocab()
+        self._byte_to_token = np.full(256, int(tokenizer.unk_token_id), dtype=np.int64)
+        for base in "ACGUN":
+            self._byte_to_token[ord(base)] = int(vocab[base])
+
+    @classmethod
+    def _validate_record(cls, record: Mapping[str, object], line_number: int) -> None:
+        HumanM6ANucleotideDataset._validate_record(record, line_number)
+        missing = cls.REQUIRED_REGION_FIELDS - set(record)
+        if missing:
+            raise ValueError(f"Line {line_number} is missing region fields: {sorted(missing)}")
+        sequence_length = len(str(record["sequence"]))
+        boundaries = [
+            int(record["utr5_start"]),
+            int(record["utr5_end"]),
+            int(record["cds_start"]),
+            int(record["cds_end"]),
+            int(record["utr3_start"]),
+            int(record["utr3_end"]),
+        ]
+        if not (
+            boundaries[0] == 0
+            and boundaries[1] == boundaries[2]
+            and boundaries[3] == boundaries[4]
+            and boundaries[5] == sequence_length
+            and boundaries == sorted(boundaries)
+        ):
+            raise ValueError(f"Line {line_number} has inconsistent full-mRNA region boundaries")
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def transcript_metadata(self, index: int) -> Dict[str, object]:
+        record = self.records[index]
+        return {
+            "transcript_id": record["transcript_id"],
+            "gene_id": record["gene_id"],
+            "length": len(str(record["sequence"])),
+            "utr5": (record["utr5_start"], record["utr5_end"]),
+            "cds": (record["cds_start"], record["cds_end"]),
+            "utr3": (record["utr3_start"], record["utr3_end"]),
+        }
+
+    def __getitem__(self, index: int):
+        record = self.records[index]
+        sequence = str(record["sequence"])
+        raw = np.frombuffer(sequence.encode("ascii"), dtype=np.uint8)
+        input_ids = torch.from_numpy(self._byte_to_token[raw].copy())
+
+        labels = torch.full((len(sequence),), IGNORE_INDEX, dtype=torch.float32)
+        candidate_positions = np.flatnonzero(raw == ord("A"))
+        if candidate_positions.size:
+            labels[torch.from_numpy(candidate_positions.astype(np.int64))] = 0.0
+        for position in record["m6a_positions"]:
+            labels[int(position)] = 1.0
         return input_ids, labels

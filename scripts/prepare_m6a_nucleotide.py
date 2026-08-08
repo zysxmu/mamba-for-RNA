@@ -10,6 +10,7 @@ stored because every other adenosine is a labelled negative.
 from __future__ import annotations
 
 import argparse
+import bisect
 import csv
 import gzip
 import hashlib
@@ -69,6 +70,141 @@ class MaskRecord(NamedTuple):
     positive_positions: tuple[int, ...]
     cds_boundary_reliable: bool
     mrna_coordinate_system_reliable: bool
+
+
+REGION_FIELDS = {
+    "utr5_start",
+    "utr5_end",
+    "cds_start",
+    "cds_end",
+    "utr3_start",
+    "utr3_end",
+    "utr5_length",
+    "cds_length",
+    "utr3_length",
+    "utr5_sequence",
+    "cds_sequence",
+    "utr3_sequence",
+    "cds_starts_with_atg",
+    "cds_ends_with_stop_codon",
+    "cds_length_multiple_of_3",
+    "cds_boundary_reliable",
+    "mrna_coordinate_system_reliable",
+}
+
+
+def _rna_sequence(value: object) -> str:
+    return str(value).strip().upper().replace("T", "U")
+
+
+def _validate_transcript_regions(
+    row: Mapping[str, object],
+    transcript_id: str,
+    sequence: str,
+    declared_length: int,
+    mask: MaskRecord,
+) -> Mapping[str, object]:
+    """Validate the 0-based half-open 5'UTR/CDS/3'UTR contract."""
+
+    coordinates = {
+        field: int(row[field])
+        for field in (
+            "utr5_start",
+            "utr5_end",
+            "cds_start",
+            "cds_end",
+            "utr3_start",
+            "utr3_end",
+        )
+    }
+    lengths = {
+        field: int(row[field])
+        for field in ("utr5_length", "cds_length", "utr3_length")
+    }
+    regions = {
+        "utr5": _rna_sequence(row["utr5_sequence"]),
+        "cds": _rna_sequence(row["cds_sequence"]),
+        "utr3": _rna_sequence(row["utr3_sequence"]),
+    }
+
+    expected_boundaries = (
+        coordinates["utr5_start"] == 0
+        and coordinates["utr5_end"] == coordinates["cds_start"]
+        and coordinates["cds_end"] == coordinates["utr3_start"]
+        and coordinates["utr3_end"] == declared_length
+    )
+    if not expected_boundaries:
+        raise ValueError(
+            f"{transcript_id}: UTR/CDS coordinates must be contiguous 0-based half-open intervals"
+        )
+    if not (
+        0
+        <= coordinates["utr5_start"]
+        <= coordinates["utr5_end"]
+        <= coordinates["cds_end"]
+        <= coordinates["utr3_end"]
+    ):
+        raise ValueError(f"{transcript_id}: invalid UTR/CDS coordinate ordering")
+
+    interval_lengths = {
+        "utr5_length": coordinates["utr5_end"] - coordinates["utr5_start"],
+        "cds_length": coordinates["cds_end"] - coordinates["cds_start"],
+        "utr3_length": coordinates["utr3_end"] - coordinates["utr3_start"],
+    }
+    if interval_lengths != lengths:
+        raise ValueError(f"{transcript_id}: declared region lengths disagree with boundaries")
+    if any(len(regions[name]) != lengths[f"{name}_length"] for name in regions):
+        raise ValueError(f"{transcript_id}: region sequence length disagrees with its declaration")
+    if sequence != regions["utr5"] + regions["cds"] + regions["utr3"]:
+        raise ValueError(f"{transcript_id}: transcript_sequence != 5'UTR + CDS + 3'UTR")
+    if (
+        sequence[coordinates["utr5_start"] : coordinates["utr5_end"]] != regions["utr5"]
+        or sequence[coordinates["cds_start"] : coordinates["cds_end"]] != regions["cds"]
+        or sequence[coordinates["utr3_start"] : coordinates["utr3_end"]] != regions["utr3"]
+    ):
+        raise ValueError(f"{transcript_id}: region coordinates do not reproduce region sequences")
+
+    cds = regions["cds"]
+    starts_with_aug = cds.startswith("AUG")
+    ends_with_stop = cds.endswith(("UAA", "UAG", "UGA"))
+    length_multiple_of_three = len(cds) % 3 == 0
+    declared_cds_checks = {
+        "cds_starts_with_atg": _parse_bool(
+            row["cds_starts_with_atg"], "cds_starts_with_atg", transcript_id
+        ),
+        "cds_ends_with_stop_codon": _parse_bool(
+            row["cds_ends_with_stop_codon"], "cds_ends_with_stop_codon", transcript_id
+        ),
+        "cds_length_multiple_of_3": _parse_bool(
+            row["cds_length_multiple_of_3"], "cds_length_multiple_of_3", transcript_id
+        ),
+    }
+    observed_cds_checks = {
+        "cds_starts_with_atg": starts_with_aug,
+        "cds_ends_with_stop_codon": ends_with_stop,
+        "cds_length_multiple_of_3": length_multiple_of_three,
+    }
+    if declared_cds_checks != observed_cds_checks:
+        raise ValueError(f"{transcript_id}: CDS sequence checks disagree with declared flags")
+
+    master_cds_reliable = _parse_bool(
+        row["cds_boundary_reliable"], "cds_boundary_reliable", transcript_id
+    )
+    master_mrna_reliable = _parse_bool(
+        row["mrna_coordinate_system_reliable"],
+        "mrna_coordinate_system_reliable",
+        transcript_id,
+    )
+    if master_cds_reliable != mask.cds_boundary_reliable:
+        raise ValueError(f"{transcript_id}: CDS reliability disagrees between master and mask")
+    if master_mrna_reliable != mask.mrna_coordinate_system_reliable:
+        raise ValueError(f"{transcript_id}: mRNA reliability disagrees between master and mask")
+
+    return {
+        **coordinates,
+        **lengths,
+        **declared_cds_checks,
+    }
 
 
 def read_masks(path: Path) -> Dict[str, MaskRecord]:
@@ -213,9 +349,16 @@ def prepare_dataset(
     try:
         with _open_text(Path(transcript_master)) as handle:
             reader = csv.DictReader(handle)
-            required = {"transcript_id", "gene_id", "transcript_length", "transcript_sequence"}
+            required = {
+                "transcript_id",
+                "gene_id",
+                "transcript_length",
+                "transcript_sequence",
+                *REGION_FIELDS,
+            }
             if reader.fieldnames is None or not required.issubset(reader.fieldnames):
-                raise ValueError(f"Transcript table is missing columns: {sorted(required)}")
+                missing_columns = sorted(required - set(reader.fieldnames or []))
+                raise ValueError(f"Transcript table is missing columns: {missing_columns}")
 
             for row in reader:
                 transcript_id = row["transcript_id"].strip()
@@ -226,7 +369,7 @@ def prepare_dataset(
                     raise ValueError(f"Duplicate transcript_master row for {transcript_id}")
 
                 gene_id = row["gene_id"].strip()
-                sequence = row["transcript_sequence"].strip().upper().replace("T", "U")
+                sequence = _rna_sequence(row["transcript_sequence"])
                 declared_length = int(row["transcript_length"])
                 if len(sequence) != declared_length or len(sequence) != mask.length:
                     raise ValueError(f"{transcript_id}: sequence, table, and mask lengths disagree")
@@ -235,6 +378,13 @@ def prepare_dataset(
                     raise ValueError(f"{transcript_id}: invalid RNA symbols {sorted(invalid)}")
                 if any(sequence[position] != "A" for position in mask.positive_positions):
                     raise ValueError(f"{transcript_id}: positive m6A mask falls on a non-A base")
+                region_metadata = _validate_transcript_regions(
+                    row=row,
+                    transcript_id=transcript_id,
+                    sequence=sequence,
+                    declared_length=declared_length,
+                    mask=mask,
+                )
 
                 split = _stable_gene_split(gene_id, seed, train_fraction, val_fraction)
                 record = {
@@ -244,6 +394,7 @@ def prepare_dataset(
                     "m6a_positions": mask.positive_positions,
                     "cds_boundary_reliable": mask.cds_boundary_reliable,
                     "mrna_coordinate_system_reliable": mask.mrna_coordinate_system_reliable,
+                    **region_metadata,
                 }
                 handles[split].write(json.dumps(record, separators=(",", ":")) + "\n")
 
@@ -259,6 +410,18 @@ def prepare_dataset(
                     mask.mrna_coordinate_system_reliable
                 )
                 stats["cds_boundary_reliable"] += int(mask.cds_boundary_reliable)
+                stats["full_transcript_training_eligible"] += int(
+                    mask.mrna_coordinate_system_reliable and mask.cds_boundary_reliable
+                )
+                for region in ("utr5", "cds", "utr3"):
+                    start = int(region_metadata[f"{region}_start"])
+                    end = int(region_metadata[f"{region}_end"])
+                    stats[f"{region}_nucleotides"] += end - start
+                    stats[f"{region}_candidate_adenosines"] += sequence[start:end].count("A")
+                    stats[f"{region}_positive_m6a"] += (
+                        bisect.bisect_left(mask.positive_positions, end)
+                        - bisect.bisect_left(mask.positive_positions, start)
+                    )
                 split_genes[split].add(gene_id)
                 matched.add(transcript_id)
     finally:
@@ -300,8 +463,14 @@ def prepare_dataset(
         split_report[split] = values
 
     report: Mapping[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "task": "nucleotide-level m6A classification at adenosine positions",
+        "sequence_contract": {
+            "sample": "one complete mRNA before optional model-length filtering",
+            "composition": "transcript_sequence = 5'UTR + CDS + 3'UTR",
+            "coordinate_system": "0-based half-open transcript coordinates",
+            "cds_start_definition": "index of the first CDS nucleotide in transcript_sequence",
+        },
         "label_semantics": {
             "1": "methylated adenosine",
             "0": "unmethylated adenosine",

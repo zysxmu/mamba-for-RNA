@@ -196,8 +196,11 @@ class DNAEmbeddingModelCaduceus(DNAEmbeddingModel):
         self, input_ids, position_ids=None, inference_params=None, state=None, **batch_metadata
     ):  # state and batch metadata are part of the repo interface
         """Caduceus forward pass; downstream metadata is consumed by the decoder."""
+        attention_mask = batch_metadata.get("attention_mask")
         if self.config.rcps:  # Hidden states have 2 * d_model channels for RCPS
-            hidden_states = self.caduceus(input_ids, return_dict=False)
+            hidden_states = self.caduceus(
+                input_ids, attention_mask=attention_mask, return_dict=False
+            )
             num_chan = hidden_states.shape[-1]
             return torch.stack(
                 [hidden_states[..., :num_chan // 2], torch.flip(hidden_states[..., num_chan // 2:], dims=[1, 2])],
@@ -205,12 +208,18 @@ class DNAEmbeddingModelCaduceus(DNAEmbeddingModel):
             ), None
         if self.conjoin_train or (self.conjoin_test and not self.training):  # For conjoining / post-hoc conjoining
             assert input_ids.ndim == 3, "Input must be 3D tensor, where channels corresponds to forward and rc strands"
-            hidden_states = self.caduceus(input_ids[..., 0], return_dict=False)
-            hidden_states_rc = self.caduceus(input_ids[..., 1], return_dict=False)
+            hidden_states = self.caduceus(
+                input_ids[..., 0], attention_mask=attention_mask, return_dict=False
+            )
+            hidden_states_rc = self.caduceus(
+                input_ids[..., 1], attention_mask=attention_mask, return_dict=False
+            )
             # Stack along channel dimension (dim=-1)
             return torch.stack([hidden_states, hidden_states_rc], dim=-1), None
 
-        return self.caduceus(input_ids, return_dict=False), None
+        return self.caduceus(
+            input_ids, attention_mask=attention_mask, return_dict=False
+        ), None
 
 
 def load_backbone(model, state_dict, freeze_backbone=False, ignore_head=True):
