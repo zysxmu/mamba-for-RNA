@@ -275,6 +275,89 @@ CUDA_VISIBLE_DEVICES=0 python -m train \
 
 For two GPUs, use `CUDA_VISIBLE_DEVICES=0,1` and `trainer.devices=2`.
 
+### Complete-transcript long-context MLM
+
+`experiment=rna_long_pretrain` is the formal long-context pretraining path.
+One sample is one complete RNA sequence, never a silent crop. The mRNA source
+uses the gene-level train/validation/test files produced by
+`prepare_m6a_nucleotide.py`; methylation labels are not read by the MLM task.
+An optional RNAcentral FASTA source supplies ncRNA and is assigned to
+reproducible 80/10/10 splits. Sequences longer than the configured 10,240-nt
+cap, coordinate-unreliable mRNAs, PAD positions, and special tokens are
+reported or excluded from the MLM loss.
+
+Run a bounded single-GPU integration test before spending a cluster allocation:
+
+```bash
+export M6A_FULL_DATA_DIR=/home/zys/mamba-for-RNA/data/processed/human_m6a_full_transcript
+export RNA_FASTA_FILE=/home/zys/mamba-for-RNA/data/rnacentral_small_ATCG_only.fasta
+MLM_CKPT=/home/zys/mamba-for-RNA/runs/rna100_lightweight/checkpoints_best/val_loss.ckpt
+RUN_DIR=/home/zys/mamba-for-RNA/runs/rna_long_10240_benchmark
+mkdir -p "$RUN_DIR"
+
+CUDA_VISIBLE_DEVICES=0 /usr/bin/time -v -o "$RUN_DIR/time.txt" \
+python -m train \
+  experiment=rna_long_pretrain \
+  trainer.devices=1 \
+  train.pretrained_model_path="$MLM_CKPT" \
+  dataset.max_train_sequences=100 \
+  dataset.max_val_sequences=16 \
+  dataset.max_test_sequences=16 \
+  trainer.max_epochs=1 \
+  trainer.max_steps=-1 \
+  trainer.accumulate_grad_batches=1 \
+  train.test=false \
+  callbacks.model_checkpoint.save_top_k=0 \
+  callbacks.periodic_checkpoint.save_top_k=0 \
+  callbacks.model_checkpoint_every_n_steps.save_top_k=0 \
+  callbacks.model_checkpoint_every_n_steps.save_last=false \
+  wandb=null \
+  hydra.run.dir="$RUN_DIR" \
+  2>&1 | tee "$RUN_DIR/console.log"
+```
+
+For the formal two-GPU continued-pretraining run, keep an effective batch of
+16 complete sequences and validate on the complete split. Starting from the
+earlier MLM checkpoint is recommended; set `train.pretrained_model_path=null`
+only for a deliberate from-scratch ablation.
+
+```bash
+export M6A_FULL_DATA_DIR=/home/zys/mamba-for-RNA/data/processed/human_m6a_full_transcript
+export RNA_FASTA_FILE=/home/zys/mamba-for-RNA/data/rnacentral_small_ATCG_only.fasta
+MLM_CKPT=/home/zys/mamba-for-RNA/runs/rna100_lightweight/checkpoints_best/val_loss.ckpt
+RUN_DIR=/home/zys/mamba-for-RNA/runs/rna_long_10240_pretrain
+mkdir -p "$RUN_DIR"
+
+CUDA_VISIBLE_DEVICES=0,1 /usr/bin/time -v -o "$RUN_DIR/time.txt" \
+python -m train \
+  experiment=rna_long_pretrain \
+  trainer.devices=2 \
+  train.pretrained_model_path="$MLM_CKPT" \
+  train.pretrained_model_strict_load=true \
+  dataset.max_sequence_length=10240 \
+  dataset.batch_size=1 \
+  dataset.batch_size_eval=1 \
+  trainer.accumulate_grad_batches=8 \
+  trainer.max_epochs=null \
+  trainer.max_steps=20000 \
+  loader.num_workers=8 \
+  train.test=false \
+  callbacks.model_checkpoint.dirpath="$RUN_DIR/checkpoints_best" \
+  callbacks.model_checkpoint.filename=val_loss \
+  callbacks.periodic_checkpoint.save_top_k=0 \
+  callbacks.model_checkpoint_every_n_steps.dirpath="$RUN_DIR/checkpoints" \
+  callbacks.model_checkpoint_every_n_steps.every_n_train_steps=1000 \
+  callbacks.model_checkpoint_every_n_steps.save_last=true \
+  wandb=null \
+  hydra.run.dir="$RUN_DIR" \
+  2>&1 | tee "$RUN_DIR/console.log"
+```
+
+After long-context MLM converges, use its best `val_loss.ckpt` as
+`train.pretrained_model_path` for `experiment=human_m6a_full_transcript`.
+That second stage replaces the MLM head with the nucleotide m6A classifier and
+fine-tunes the complete model on labelled adenosines.
+
 ## Nucleotide-level human m6A fine-tuning
 
 The full-mRNA task uses `transcript_sequence` as input and the equally long
