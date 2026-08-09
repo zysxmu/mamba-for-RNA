@@ -462,6 +462,47 @@ Do not set `train.ckpt` to the old window checkpoint: that is an exact resume
 and would also restore its optimizer and epoch state. Use
 `train.pretrained_model_path` as shown above for a new long-context run.
 
+### Leakage-safe threshold calibration and stratified evaluation
+
+The full-transcript evaluator first chooses one decision threshold using the
+validation split only. It then freezes that threshold before evaluating the
+gene-disjoint test split. This avoids tuning the classifier on test labels.
+In addition to overall AP and AUROC, it reports thresholded precision, recall,
+F1, balanced accuracy, and MCC, plus separate test results for 5'UTR, CDS,
+3'UTR, and transcript-length bins. Metrics are accumulated with bounded-memory
+histograms rather than retaining every adenosine score in RAM.
+
+The command below can run on GPU 1 while a pretraining job occupies GPU 0:
+
+```bash
+cd /home/zys/mamba-for-RNA
+conda activate rna-mamba
+
+BEST_CKPT=/home/zys/mamba-for-RNA/runs/human_m6a_full_10240_from_long/checkpoints_best/val_m6a_ap.ckpt
+M6A_DATA=/home/zys/mamba-for-RNA/data/processed/human_m6a_full_transcript
+EVAL_DIR=/home/zys/mamba-for-RNA/runs/human_m6a_full_10240_from_long/calibrated_evaluation
+mkdir -p "$EVAL_DIR"
+
+CUDA_VISIBLE_DEVICES=1 /usr/bin/time -v -o "$EVAL_DIR/time.txt" \
+python scripts/evaluate_m6a_full_transcript.py \
+  --checkpoint "$BEST_CKPT" \
+  --data-dir "$M6A_DATA" \
+  --output-dir "$EVAL_DIR" \
+  --batch-size 1 \
+  --num-workers 8 \
+  --device cuda \
+  --bins 4096 \
+  --threshold-objective f1 \
+  2>&1 | tee "$EVAL_DIR/console.log"
+```
+
+The primary machine-readable result is
+`m6a_calibrated_evaluation.json`. The directory also contains a combined CSV,
+validation-threshold search data, PR/ROC source data, and publication-ready
+PNG, SVG, and PDF figures. If Matplotlib is unavailable, install the pinned
+version with `python -m pip install matplotlib==3.7.4`; all metric tables are
+still written before plotting.
+
 ### Legacy 1024-nt window baseline
 
 Run a one-epoch integration smoke test before the full job. The warm-start
@@ -569,6 +610,7 @@ python -m pytest -q \
   caduceus/tests/test_padding_aware_bimamba.py \
   tests/test_human_m6a_window.py \
   tests/test_m6a_nucleotide.py \
+  tests/test_m6a_full_transcript_evaluation.py \
   tests/test_m6a_sparse.py \
   tests/test_checkpoint_and_collate_contracts.py
 ```
@@ -588,6 +630,7 @@ src/m6a_sparse.py       implicit window system and non-negative sparse solver
 scripts/                m6A preparation and sparse site-recovery entry points
 scripts/prepare_human_m6a.py  human m6A mapping and gene-level splitting
 scripts/prepare_m6a_nucleotide.py  full-mRNA mask validation and gene splitting
+scripts/evaluate_m6a_full_transcript.py  validation-calibrated full-mRNA evaluation
 src/callbacks/          runtime and validation logging
 slurm_scripts/          cluster submission scripts
 tests/fixtures/         synthetic smoke-test data
