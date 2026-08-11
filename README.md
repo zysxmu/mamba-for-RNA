@@ -5,6 +5,16 @@ modeling. This implementation keeps the original project structure from
 commit `bea4cda9a88e4e45490cfabc425e7dd32be29483` and applies only correctness
 fixes plus a lightweight cross-layer memory path.
 
+## Formal 8-GPU training
+
+For the current production workflow, use
+[`docs/FORMAL_8GPU_TRAINING.md`](docs/FORMAL_8GPU_TRAINING.md) and
+[`scripts/run_formal_8gpu.sh`](scripts/run_formal_8gpu.sh). The validated plan
+is 50,000 long-context MLM optimizer steps (about 15.7 epochs at global batch
+16), followed by one epoch of complete-transcript m6A fine-tuning and
+validation-calibrated gene-disjoint testing. Older single-GPU and two-GPU
+commands below are retained as development and ablation examples.
+
 ## Model
 
 Each layer contains the original weight-tied BiMamba backbone. At configured
@@ -316,42 +326,12 @@ python -m train \
   2>&1 | tee "$RUN_DIR/console.log"
 ```
 
-For the formal two-GPU continued-pretraining run, keep an effective batch of
-16 complete sequences and validate on the complete split. Starting from the
-earlier MLM checkpoint is recommended; set `train.pretrained_model_path=null`
-only for a deliberate from-scratch ablation.
-
-```bash
-export M6A_FULL_DATA_DIR=/home/zys/mamba-for-RNA/data/processed/human_m6a_full_transcript
-export RNA_FASTA_FILE=/home/zys/mamba-for-RNA/data/rnacentral_small_ATCG_only.fasta
-MLM_CKPT=/home/zys/mamba-for-RNA/runs/rna100_lightweight/checkpoints_best/val_loss.ckpt
-RUN_DIR=/home/zys/mamba-for-RNA/runs/rna_long_10240_pretrain
-mkdir -p "$RUN_DIR"
-
-CUDA_VISIBLE_DEVICES=0,1 /usr/bin/time -v -o "$RUN_DIR/time.txt" \
-python -m train \
-  experiment=rna_long_pretrain \
-  trainer.devices=2 \
-  train.pretrained_model_path="$MLM_CKPT" \
-  train.pretrained_model_strict_load=true \
-  dataset.max_sequence_length=10240 \
-  dataset.batch_size=1 \
-  dataset.batch_size_eval=1 \
-  trainer.accumulate_grad_batches=8 \
-  trainer.max_epochs=null \
-  trainer.max_steps=20000 \
-  loader.num_workers=8 \
-  train.test=false \
-  callbacks.model_checkpoint.dirpath="$RUN_DIR/checkpoints_best" \
-  callbacks.model_checkpoint.filename=val_loss \
-  callbacks.periodic_checkpoint.save_top_k=0 \
-  callbacks.model_checkpoint_every_n_steps.dirpath="$RUN_DIR/checkpoints" \
-  callbacks.model_checkpoint_every_n_steps.every_n_train_steps=1000 \
-  callbacks.model_checkpoint_every_n_steps.save_last=true \
-  wandb=null \
-  hydra.run.dir="$RUN_DIR" \
-  2>&1 | tee "$RUN_DIR/console.log"
-```
+The validated formal limit is 50,000 optimizer steps at global batch 16,
+which is about 15.7 epochs on the current corpus. The best scratch checkpoint
+occurred at step 47,851; extending the run to 70,000 steps did not improve
+validation loss. For an 8-GPU node, use one sequence per GPU and two gradient
+accumulation steps. The exact command, checkpoint layout, resume rules, and
+resource estimate are in the formal 8-GPU guide linked above.
 
 After long-context MLM converges, use its best `val_loss.ckpt` as
 `train.pretrained_model_path` for `experiment=human_m6a_full_transcript`.
@@ -432,31 +412,12 @@ python -m train \
   2>&1 | tee "$RUN_DIR/console.log"
 ```
 
-If the benchmark is stable, run the complete job. This preserves the existing
-nucleotide-level classifier and fine-tunes all model parameters on complete
-transcripts:
-
-```bash
-export M6A_NT_DATA_DIR=/home/zys/mamba-for-RNA/data/processed/human_m6a_nucleotide
-NT_CKPT=/home/zys/mamba-for-RNA/runs/human_m6a_nucleotide_full_retry/checkpoints/val/m6a_average_precision.ckpt
-RUN_DIR=/home/zys/mamba-for-RNA/runs/human_m6a_full_10240
-mkdir -p "$RUN_DIR"
-
-CUDA_VISIBLE_DEVICES=0 /usr/bin/time -v -o "$RUN_DIR/time.txt" \
-python -m train \
-  experiment=human_m6a_full_transcript \
-  train.pretrained_model_path="$NT_CKPT" \
-  train.pretrained_model_strict_load=true \
-  dataset.max_sequence_length=10240 \
-  dataset.batch_size=1 \
-  dataset.batch_size_eval=1 \
-  loader.num_workers=8 \
-  trainer.max_epochs=5 \
-  trainer.accumulate_grad_batches=16 \
-  wandb=null \
-  hydra.run.dir="$RUN_DIR" \
-  2>&1 | tee "$RUN_DIR/console.log"
-```
+If the benchmark is stable, initialize from the best long-context MLM
+`val_loss.ckpt` and fine-tune all model parameters for one epoch. Across the
+validated runs, the first epoch was consistently the best validation-AP
+checkpoint and later epochs overfit. On eight GPUs, keep global batch 16 with
+`dataset.batch_size=1` and `trainer.accumulate_grad_batches=2`. Use
+`bash scripts/run_formal_8gpu.sh finetune` for the exact launch command.
 
 Do not set `train.ckpt` to the old window checkpoint: that is an exact resume
 and would also restore its optimizer and epoch state. Use
@@ -502,6 +463,24 @@ validation-threshold search data, PR/ROC source data, and publication-ready
 PNG, SVG, and PDF figures. If Matplotlib is unavailable, install the pinned
 version with `python -m pip install matplotlib==3.7.4`; all metric tables are
 still written before plotting.
+
+### Current complete-transcript results
+
+The same gene-disjoint test set was used for every row. Thresholds were chosen
+on validation only and frozen before testing. AP is the primary metric because
+positive m6A calls make up approximately 4.37% of candidate adenosines.
+
+| Initialization | Test AP | AUROC | Precision | Recall | F1 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Original full-mRNA baseline | 0.6924 | 0.9839 | 0.6242 | 0.7623 | 0.6864 |
+| Scratch long-context MLM, 20k steps | 0.7143 | 0.9854 | 0.6346 | 0.7801 | 0.6999 |
+| Scratch long-context MLM, 50k steps | 0.7179 | 0.9854 | 0.6364 | 0.7679 | 0.6960 |
+| Continued long-context MLM | **0.7259** | **0.9856** | 0.6351 | 0.7724 | 0.6970 |
+
+The 50k scratch model improved AP for transcripts longer than 8,192 nt from
+0.6535 to 0.6775 relative to the 20k scratch model. Continued pretraining is
+the best current initialization by overall AP; the scratch 50k run remains the
+clean from-scratch ablation.
 
 ### Legacy 1024-nt window baseline
 
