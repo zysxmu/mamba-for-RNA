@@ -5,15 +5,369 @@ modeling. This implementation keeps the original project structure from
 commit `bea4cda9a88e4e45490cfabc425e7dd32be29483` and applies only correctness
 fixes plus a lightweight cross-layer memory path.
 
-## Formal 8-GPU training
+## Production server workflow (8 GPUs)
 
-For the current production workflow, use
-[`docs/FORMAL_8GPU_TRAINING.md`](docs/FORMAL_8GPU_TRAINING.md) and
-[`scripts/run_formal_8gpu.sh`](scripts/run_formal_8gpu.sh). The validated plan
-is 50,000 long-context MLM optimizer steps (about 15.7 epochs at global batch
-16), followed by one epoch of complete-transcript m6A fine-tuning and
-validation-calibrated gene-disjoint testing. Older single-GPU and two-GPU
-commands below are retained as development and ablation examples.
+This section is the shortest complete path from a fresh cluster account to a
+formal RNA-Mamba result. It runs the following stages in order:
+
+1. 50,000 optimizer steps of 10,240-nt masked-language-model (MLM)
+   pretraining;
+2. one epoch of full-model, nucleotide-level m6A fine-tuning on complete
+   `5'UTR + CDS + 3'UTR` transcripts;
+3. validation-threshold calibration and evaluation on the gene-disjoint test
+   set.
+
+The launcher is [`scripts/run_formal_8gpu.sh`](scripts/run_formal_8gpu.sh).
+The expanded configuration rationale, measured results, checkpoint semantics,
+and resource estimates are in
+[`docs/FORMAL_8GPU_TRAINING.md`](docs/FORMAL_8GPU_TRAINING.md). Commands later
+in this README are retained for single-GPU development and ablation; they do
+not supersede this production recipe.
+
+### 1. Cluster requirements
+
+The validated software stack is Linux, Python 3.10, PyTorch 2.2.0, CUDA 12.x,
+`causal-conv1d==1.2.0.post2`, and `mamba-ssm==1.2.2`. The formal configuration
+assumes one node with eight NVIDIA GPUs. Eight A100 GPUs are recommended.
+
+Before installation, check the allocation and filesystem:
+
+```bash
+nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv
+df -h "$HOME" /path/to/runs
+```
+
+Reserve at least 30 GB of free disk space for prepared data, logs, the best and
+last checkpoints, and periodic recovery checkpoints. Each full checkpoint is
+approximately 579 MB. Do not launch the job on a cluster login node; run it
+inside an interactive GPU allocation or a scheduler job.
+
+### 2. Clone and identify the code
+
+Configure GitHub SSH access for the cluster account, then clone the repository:
+
+```bash
+cd /path/to/workspace
+git clone git@github.com:zysxmu/mamba-for-RNA.git
+cd mamba-for-RNA
+
+git branch --show-current
+git log -1 --oneline
+git status --short
+```
+
+Formal training should use a clean `main` worktree. The launcher records the
+exact Git commit and dirty-worktree count in `run_manifest.txt`, so results can
+always be traced back to their code.
+
+### 3. Create the environment
+
+The following Conda installation matches the tested binary wheels:
+
+```bash
+conda create -n rna-mamba python=3.10 -y
+conda activate rna-mamba
+
+python -m pip install --upgrade "pip<27" "setuptools<70" wheel packaging ninja
+python -m pip install \
+  torch==2.2.0 torchvision==0.17.0 torchaudio==2.2.0 \
+  --index-url https://download.pytorch.org/whl/cu121
+python -m pip install -r requirements-core.txt
+
+python -m pip install \
+  "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.2.0.post2/causal_conv1d-1.2.0.post2%2Bcu122torch2.2cxx11abiFALSE-cp310-cp310-linux_x86_64.whl"
+python -m pip install \
+  "https://github.com/state-spaces/mamba/releases/download/v1.2.2/mamba_ssm-1.2.2%2Bcu122torch2.2cxx11abiFALSE-cp310-cp310-linux_x86_64.whl"
+```
+
+If GitHub downloads are slow, download the two wheels elsewhere, transfer them
+to the server, and replace the two URLs with their absolute local paths. The
+same installation is automated by `setup_linux_env.sh` when a system
+`python3.10` executable is available; that script creates `.venv` rather than
+a Conda environment.
+
+Verify CUDA kernels and the repository before allocating eight GPUs:
+
+```bash
+python - <<'PY'
+import causal_conv1d
+import mamba_ssm
+import torch
+
+print("torch:", torch.__version__)
+print("torch CUDA runtime:", torch.version.cuda)
+print("CUDA available:", torch.cuda.is_available())
+print("GPU count:", torch.cuda.device_count())
+if torch.cuda.is_available():
+    print("GPU 0:", torch.cuda.get_device_name(0))
+print("causal-conv1d:", getattr(causal_conv1d, "__version__", "installed"))
+print("mamba-ssm:", getattr(mamba_ssm, "__version__", "installed"))
+PY
+
+python -m pytest -q \
+  caduceus/tests \
+  tests/test_full_transcript_mlm.py \
+  tests/test_m6a_nucleotide.py \
+  tests/test_m6a_full_transcript_evaluation.py \
+  tests/test_checkpoint_and_collate_contracts.py
+```
+
+Do not continue if package import, CUDA availability, or tests fail.
+
+### 4. Place and prepare the data
+
+The production workflow requires the following four source files:
+
+```text
+/path/to/source_tables/
+  transcript_master.csv.gz
+  m6a_nt_mask_full_mrna.csv.gz
+  exon_coordinate_map.csv.gz
+
+/path/to/rnacentral_small_ATCG_only.fasta
+```
+
+`transcript_master.csv.gz` supplies reference transcript sequences and
+`5'UTR/CDS/3'UTR` coordinates. `m6a_nt_mask_full_mrna.csv.gz` supplies one m6A
+label per nucleotide: `1` is methylated, `0` is unmethylated, and non-A
+positions are excluded from the m6A loss. `exon_coordinate_map.csv.gz` audits
+genome-to-transcript coordinates. These files do not contain SNP alleles or
+genotypes; SNP-aware training is a later extension and is not required for the
+current run.
+
+Prepare gene-disjoint compressed splits:
+
+```bash
+cd /path/to/mamba-for-RNA
+conda activate rna-mamba
+
+SOURCE_DIR=/path/to/source_tables
+M6A_DATA=/path/to/processed/human_m6a_full_transcript
+mkdir -p "$M6A_DATA"
+
+python scripts/prepare_m6a_nucleotide.py \
+  --transcript-master "$SOURCE_DIR/transcript_master.csv.gz" \
+  --mask-table "$SOURCE_DIR/m6a_nt_mask_full_mrna.csv.gz" \
+  --exon-map "$SOURCE_DIR/exon_coordinate_map.csv.gz" \
+  --output-dir "$M6A_DATA" \
+  2>&1 | tee "$M6A_DATA/prepare.log"
+```
+
+Audit the contract before training:
+
+```bash
+python - "$M6A_DATA/stats.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+stats = json.load(open(path, encoding="utf-8"))
+assert stats["schema_version"] == 2
+assert stats["sequence_contract"]["composition"] == \
+    "transcript_sequence = 5'UTR + CDS + 3'UTR"
+assert stats["splitting"]["leaking_genes"] == 0
+
+for split in ("train", "val", "test"):
+    row = stats["splits"][split]
+    assert row["full_transcript_training_eligible"] > 0
+    print(
+        split,
+        "eligible_transcripts=", row["full_transcript_training_eligible"],
+        "candidate_A=", row["candidate_adenosines"],
+        "positive_m6a=", row["positive_m6a"],
+    )
+print("data audit: PASS")
+PY
+
+ls -lh \
+  "$M6A_DATA/train.jsonl.gz" \
+  "$M6A_DATA/val.jsonl.gz" \
+  "$M6A_DATA/test.jsonl.gz" \
+  "$M6A_DATA/stats.json"
+```
+
+With the supplied tables, the 10,240-nt cap retains 39,349 training, 4,805
+validation, and 4,723 test transcripts after reliability and length checks.
+The split contains no shared genes.
+
+### 5. Run the complete workflow on eight GPUs
+
+The default command starts long-context pretraining from random model weights,
+then automatically fine-tunes and evaluates its best validation-loss
+checkpoint:
+
+```bash
+cd /path/to/mamba-for-RNA
+conda activate rna-mamba
+
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export NUM_DEVICES=8
+export BATCH_SIZE=1
+export GRAD_ACCUM=2
+export NUM_WORKERS=8
+
+export M6A_DATA=/path/to/processed/human_m6a_full_transcript
+export RNA_FASTA_FILE=/path/to/rnacentral_small_ATCG_only.fasta
+export RUN_ROOT=/path/to/runs/rna_mamba_formal_8gpu
+
+unset PRETRAIN_INIT_CKPT
+unset PRETRAIN_RESUME_CKPT
+
+bash scripts/run_formal_8gpu.sh all
+```
+
+The launcher checks the global batch before starting:
+
+```text
+8 GPUs x 1 sequence/GPU x 2 accumulation steps = global batch 16
+```
+
+It then uses 50,000 MLM optimizer steps, approximately 15.7 epochs on the
+validated corpus, and one m6A fine-tuning epoch. Do not change accumulation to
+16 on eight GPUs: that would silently increase the global batch from 16 to
+128 and make the experiment incomparable.
+
+The from-scratch run is the independent model-training experiment. If the
+established 1,024-nt MLM checkpoint is available, long-context continuation
+currently gives the best downstream AP. Start that as a new experiment with:
+
+```bash
+export RUN_ROOT=/path/to/runs/rna_mamba_formal_8gpu_continued
+export PRETRAIN_INIT_CKPT=/absolute/path/to/rna100_lightweight/checkpoints_best/val_loss.ckpt
+unset PRETRAIN_RESUME_CKPT
+
+bash scripts/run_formal_8gpu.sh all
+```
+
+`PRETRAIN_INIT_CKPT` starts a new optimizer and scheduler from model weights.
+It is not an interrupted-job resume.
+
+### 6. Slurm example
+
+Scheduler directives differ by cluster. The template below requests one
+eight-GPU node; replace the partition, account, environment path, and data
+paths with site-specific values:
+
+```bash
+#!/usr/bin/env bash
+#SBATCH --job-name=rna_mamba
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gpus-per-node=8
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=128G
+#SBATCH --time=08:00:00
+#SBATCH --output=/path/to/runs/rna_mamba_formal_8gpu/slurm-%j.out
+#SBATCH --error=/path/to/runs/rna_mamba_formal_8gpu/slurm-%j.err
+#SBATCH --partition=YOUR_GPU_PARTITION
+#SBATCH --account=YOUR_ACCOUNT
+
+set -euo pipefail
+source /path/to/miniconda3/etc/profile.d/conda.sh
+conda activate rna-mamba
+
+cd /path/to/mamba-for-RNA
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export NUM_DEVICES=8
+export BATCH_SIZE=1
+export GRAD_ACCUM=2
+export NUM_WORKERS=8
+export M6A_DATA=/path/to/processed/human_m6a_full_transcript
+export RNA_FASTA_FILE=/path/to/rnacentral_small_ATCG_only.fasta
+export RUN_ROOT=/path/to/runs/rna_mamba_formal_8gpu
+
+bash scripts/run_formal_8gpu.sh all
+```
+
+Submit and monitor it with the commands supported by the cluster, for example:
+
+```bash
+sbatch run_rna_mamba.slurm
+squeue -u "$USER"
+tail -f /path/to/runs/rna_mamba_formal_8gpu/pretrain/console.log
+watch -n 5 nvidia-smi
+```
+
+### 7. Interrupted-run recovery
+
+For an exact pretraining resume, use the last checkpoint. This restores model
+weights, optimizer, scheduler, epoch, and global step:
+
+```bash
+export RUN_ROOT=/path/to/runs/rna_mamba_formal_8gpu
+unset PRETRAIN_INIT_CKPT
+export PRETRAIN_RESUME_CKPT="$RUN_ROOT/pretrain/checkpoints/last.ckpt"
+
+bash scripts/run_formal_8gpu.sh pretrain
+```
+
+After pretraining is complete, stages can be launched independently:
+
+```bash
+export PRETRAIN_CKPT="$RUN_ROOT/pretrain/checkpoints_best/val_loss.ckpt"
+bash scripts/run_formal_8gpu.sh finetune
+
+export FINETUNE_CKPT="$RUN_ROOT/finetune/checkpoints_best/val_m6a_ap.ckpt"
+bash scripts/run_formal_8gpu.sh evaluate
+```
+
+Never use `PRETRAIN_INIT_CKPT` and `PRETRAIN_RESUME_CKPT` together. Never use a
+fine-tuning checkpoint as `PRETRAIN_INIT_CKPT`.
+
+### 8. Successful-run checklist
+
+Retain the following files when the workflow finishes:
+
+```text
+RUN_ROOT/run_manifest.txt
+RUN_ROOT/pretrain/checkpoints_best/val_loss.ckpt
+RUN_ROOT/pretrain/checkpoints/last.ckpt
+RUN_ROOT/pretrain/console.log
+RUN_ROOT/pretrain/time.txt
+RUN_ROOT/finetune/checkpoints_best/val_m6a_ap.ckpt
+RUN_ROOT/finetune/console.log
+RUN_ROOT/finetune/time.txt
+RUN_ROOT/finetune/calibrated_evaluation/m6a_calibrated_evaluation.json
+RUN_ROOT/finetune/calibrated_evaluation/rna_mamba_m6a_calibrated_evaluation.png
+RUN_ROOT/finetune/calibrated_evaluation/rna_mamba_m6a_calibrated_evaluation.pdf
+RUN_ROOT/finetune/calibrated_evaluation/rna_mamba_m6a_calibrated_evaluation.svg
+```
+
+The final report should include the Git commit, GPU count and type, wall time,
+best pretraining step and validation loss, test AP/AUROC/F1, and the threshold
+selected on validation. AP is the primary downstream metric because only
+approximately 4.37% of candidate adenosines are positive.
+
+The current reference results on the same gene-disjoint test set are:
+
+| Initialization before m6A fine-tuning | Test AP | AUROC | F1 |
+| --- | ---: | ---: | ---: |
+| Original full-mRNA baseline | 0.6924 | 0.9839 | 0.6864 |
+| Scratch long-context MLM, 20k steps | 0.7143 | 0.9854 | 0.6999 |
+| Scratch long-context MLM, 50k steps | 0.7179 | 0.9854 | 0.6960 |
+| Continued long-context MLM | **0.7259** | **0.9856** | 0.6970 |
+
+Scratch validation loss was best at step 47,851. Extending the same run from
+50,000 to 70,000 optimizer steps did not improve the best checkpoint, so the
+formal stopping limit remains 50,000 steps with best-checkpoint selection.
+
+### 9. Common launch failures
+
+- **`No module named pytest`**: the wrong Conda environment is active. Run
+  `conda activate rna-mamba` and verify `which python`.
+- **`No module named mamba_ssm`**: install the Python 3.10, PyTorch 2.2 wheel
+  shown above; do not use a wheel built for another Python or PyTorch ABI.
+- **Global-batch error**: keep `NUM_DEVICES=8`, `BATCH_SIZE=1`, and
+  `GRAD_ACCUM=2`, or deliberately redesign the optimizer schedule.
+- **Missing prepared data**: rerun the preparation and audit commands; the
+  launcher requires all three `.jsonl.gz` splits and `stats.json`.
+- **CUDA out of memory**: first confirm that per-GPU batch size is one and that
+  no unrelated process occupies the GPUs. Do not silently crop transcripts.
+- **Disk full or stalled checkpoint writes**: inspect `df -h` and retain the
+  best and last checkpoints before removing superseded periodic checkpoints.
+- **Training stopped with no Python process in `nvidia-smi`**: inspect the end
+  of `console.log`, the Slurm `.err` file, scheduler state, and `time.txt`
+  before restarting.
 
 ## Model
 
