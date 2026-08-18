@@ -5,10 +5,46 @@ modeling. This implementation keeps the original project structure from
 commit `bea4cda9a88e4e45490cfabc425e7dd32be29483` and applies only correctness
 fixes plus a lightweight cross-layer memory path.
 
-## Production server workflow (8 GPUs)
+## Current 6M-sequence pretraining plan
 
-This section is the shortest complete path from a fresh cluster account to a
-formal RNA-Mamba result. It runs the following stages in order:
+The current production target is **3,000,000 RNAcentral non-coding RNA
+records plus 3,000,000 coding-RNA records**, with complete sequences up to
+10,240 nt. The delivery archive contains fewer than 3M independent full-length
+mRNAs, so the coding half is assembled transparently from primary full-mRNA
+and prokaryotic coding records, then filled to 3M with explicitly labelled
+eukaryotic CDS views. m6A labels are excluded from pretraining and reserved
+for later fine-tuning.
+
+The million-scale loader uses memory-mapped sequence and offset files; it does
+not copy six million Python strings into every DDP process. The preparation
+script, data audit, exact epoch-to-step calculation, eight-GPU launcher,
+resource estimate, and resume procedure are documented in
+[`docs/PRETRAINING_6M.md`](docs/PRETRAINING_6M.md).
+
+Minimal entry points:
+
+```bash
+python scripts/prepare_pretraining_6m.py \
+  --bundle /path/to/生信.zip \
+  --output-dir /path/to/data/processed/rna_pretraining_6m \
+  --temp-dir /path/to/fast-temporary-storage
+
+export RNA_PRETRAIN_INDEXED_DIR=/path/to/data/processed/rna_pretraining_6m
+export RUN_DIR=/path/to/runs/rna_pretraining_6m
+export PRETRAIN_EPOCHS=2
+bash scripts/run_pretrain_6m_8gpu.sh
+```
+
+With the default 98/1/1 split and global batch 16, one full corpus pass is
+approximately 367,500 optimizer steps and the initial two-epoch plan is about
+735,000 steps. The launcher reads the exact training count from
+`manifest.json` and calculates these values automatically.
+
+## Legacy validated small-corpus workflow (8 GPUs)
+
+This older workflow records the already validated small-corpus experiments and
+m6A results. Use the 6M recipe above for the next pretraining run. It runs the
+following stages in order:
 
 1. 50,000 optimizer steps of 10,240-nt masked-language-model (MLM)
    pretraining;

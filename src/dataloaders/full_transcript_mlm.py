@@ -13,6 +13,7 @@ from src.dataloaders.datasets.full_transcript_mlm_dataset import (
     FullTranscriptMLMDataset,
     collate_full_transcript_mlm,
 )
+from src.dataloaders.datasets.indexed_rna_mlm_dataset import IndexedRNAMLMDataset
 
 
 class FullTranscriptRNAMLM(SequenceDataset):
@@ -25,6 +26,7 @@ class FullTranscriptRNAMLM(SequenceDataset):
         self,
         _name_: str,
         data_dir,
+        indexed_data_dir=None,
         ncrna_fasta=None,
         include_ncrna: bool = True,
         tokenizer_name: str = "char",
@@ -48,6 +50,11 @@ class FullTranscriptRNAMLM(SequenceDataset):
             raise ValueError("FullTranscriptRNAMLM requires mlm=true")
         self.ncrna_fasta = (
             None if ncrna_fasta is None else to_absolute_path(str(ncrna_fasta))
+        )
+        self.indexed_data_dir = (
+            None
+            if indexed_data_dir is None
+            else to_absolute_path(str(indexed_data_dir))
         )
         self.include_ncrna = bool(include_ncrna)
         self.tokenizer_name = tokenizer_name
@@ -86,7 +93,14 @@ class FullTranscriptRNAMLM(SequenceDataset):
             padding_side="right",
         )
         self.vocab_size = len(self.tokenizer)
-        common = {
+        indexed_common = {
+            "data_dir": self.indexed_data_dir,
+            "tokenizer": self.tokenizer,
+            "max_sequence_length": self.max_sequence_length,
+            "mlm_probability": self.mlm_probability,
+            "seed": self.split_seed,
+        }
+        legacy_common = {
             "tokenizer": self.tokenizer,
             "max_sequence_length": self.max_sequence_length,
             "ncrna_fasta": self.ncrna_fasta,
@@ -96,26 +110,36 @@ class FullTranscriptRNAMLM(SequenceDataset):
             "mlm_probability": self.mlm_probability,
             "seed": self.split_seed,
         }
-        self.dataset_train = FullTranscriptMLMDataset(
-            self._split_path("train"),
-            split="train",
-            deterministic_mlm=False,
-            max_sequences=self.max_train_sequences,
-            **common,
+        dataset_cls = FullTranscriptMLMDataset
+        common = legacy_common
+        paths = None
+        if self.indexed_data_dir is not None:
+            dataset_cls = IndexedRNAMLMDataset
+            common = indexed_common
+        else:
+            paths = {
+                split: self._split_path(split) for split in ("train", "val", "test")
+            }
+
+        def make_dataset(split, deterministic_mlm, max_sequences):
+            kwargs = {
+                "split": split,
+                "deterministic_mlm": deterministic_mlm,
+                "max_sequences": max_sequences,
+                **common,
+            }
+            if dataset_cls is FullTranscriptMLMDataset:
+                return dataset_cls(paths[split], **kwargs)
+            return dataset_cls(**kwargs)
+
+        self.dataset_train = make_dataset(
+            "train", deterministic_mlm=False, max_sequences=self.max_train_sequences
         )
-        self.dataset_val = FullTranscriptMLMDataset(
-            self._split_path("val"),
-            split="val",
-            deterministic_mlm=True,
-            max_sequences=self.max_val_sequences,
-            **common,
+        self.dataset_val = make_dataset(
+            "val", deterministic_mlm=True, max_sequences=self.max_val_sequences
         )
-        self.dataset_test = FullTranscriptMLMDataset(
-            self._split_path("test"),
-            split="test",
-            deterministic_mlm=True,
-            max_sequences=self.max_test_sequences,
-            **common,
+        self.dataset_test = make_dataset(
+            "test", deterministic_mlm=True, max_sequences=self.max_test_sequences
         )
         for split, dataset in (
             ("train", self.dataset_train),
@@ -126,10 +150,12 @@ class FullTranscriptRNAMLM(SequenceDataset):
                 "[FullTranscriptRNAMLM] "
                 f"split={split} sequences={len(dataset)} sources={dataset.source_counts} "
                 f"nucleotides={dataset.nucleotides} "
-                f"excluded_overlength={dataset.excluded_overlength} "
-                f"excluded_invalid={dataset.excluded_invalid} "
-                f"excluded_unreliable_mrna={dataset.excluded_unreliable_mrna} "
-                f"excluded_unreliable_cds={dataset.excluded_unreliable_cds}"
+                f"excluded_overlength={getattr(dataset, 'excluded_overlength', 0)} "
+                f"excluded_invalid={getattr(dataset, 'excluded_invalid', 0)} "
+                "excluded_unreliable_mrna="
+                f"{getattr(dataset, 'excluded_unreliable_mrna', 0)} "
+                "excluded_unreliable_cds="
+                f"{getattr(dataset, 'excluded_unreliable_cds', 0)}"
             )
 
     def _collate_fn(self, batch, *args, **kwargs):
