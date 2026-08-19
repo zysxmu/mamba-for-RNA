@@ -5,45 +5,49 @@ modeling. This implementation keeps the original project structure from
 commit `bea4cda9a88e4e45490cfabc425e7dd32be29483` and applies only correctness
 fixes plus a lightweight cross-layer memory path.
 
-## Current 6M-sequence pretraining plan
+## Current 5M-sequence pretraining plan
 
 The current production target is **3,000,000 RNAcentral non-coding RNA
-records plus 3,000,000 coding-RNA records**, with complete sequences up to
-10,240 nt. The delivery archive contains fewer than 3M independent full-length
-mRNAs, so the coding half is assembled transparently from primary full-mRNA
-and prokaryotic coding records, then filled to 3M with explicitly labelled
-eukaryotic CDS views. m6A labels are excluded from pretraining and reserved
+records plus approximately 2,000,000 coding-RNA records**, with complete
+sequences up to 10,240 nt. The coding pool uses independent full-mRNA records
+from 45 eukaryotic species, human and mouse, plus prokaryotic CDS records. Its
+raw size is 1,953,101 records before length filtering and content
+deduplication. The default policy uses every eligible independent coding
+record and does not duplicate a full mRNA as a second CDS view merely to reach
+an exact round number. m6A labels are excluded from pretraining and reserved
 for later fine-tuning.
 
 The million-scale loader uses memory-mapped sequence and offset files; it does
-not copy six million Python strings into every DDP process. The preparation
+not copy five million Python strings into every DDP process. The preparation
 script, data audit, exact epoch-to-step calculation, eight-GPU launcher,
 resource estimate, and resume procedure are documented in
-[`docs/PRETRAINING_6M.md`](docs/PRETRAINING_6M.md).
+[`docs/PRETRAINING_5M.md`](docs/PRETRAINING_5M.md).
 
 Minimal entry points:
 
 ```bash
-python scripts/prepare_pretraining_6m.py \
+python scripts/prepare_pretraining_5m.py \
   --bundle /path/to/生信.zip \
-  --output-dir /path/to/data/processed/rna_pretraining_6m \
+  --mouse-transcript-master /path/to/mouse_transcript_master.csv.gz \
+  --output-dir /path/to/data/processed/rna_pretraining_5m \
   --temp-dir /path/to/fast-temporary-storage
 
-export RNA_PRETRAIN_INDEXED_DIR=/path/to/data/processed/rna_pretraining_6m
-export RUN_DIR=/path/to/runs/rna_pretraining_6m
+export RNA_PRETRAIN_INDEXED_DIR=/path/to/data/processed/rna_pretraining_5m
+export RUN_DIR=/path/to/runs/rna_pretraining_5m
 export PRETRAIN_EPOCHS=2
-bash scripts/run_pretrain_6m_8gpu.sh
+bash scripts/run_pretrain_5m_8gpu.sh
 ```
 
-With the default 98/1/1 split and global batch 16, one full corpus pass is
-approximately 367,500 optimizer steps and the initial two-epoch plan is about
-735,000 steps. The launcher reads the exact training count from
-`manifest.json` and calculates these values automatically.
+With the default 98/1/1 split and global batch 16, the expected five-million
+record corpus needs approximately 306,250 optimizer steps per complete pass
+and about 612,500 steps for the initial two-epoch plan. Because coding records
+are filtered and deduplicated, the launcher reads the exact training count
+from `manifest.json` and calculates the real values automatically.
 
 ## Legacy validated small-corpus workflow (8 GPUs)
 
 This older workflow records the already validated small-corpus experiments and
-m6A results. Use the 6M recipe above for the next pretraining run. It runs the
+m6A results. Use the 5M recipe above for the next pretraining run. It runs the
 following stages in order:
 
 1. 50,000 optimizer steps of 10,240-nt masked-language-model (MLM)

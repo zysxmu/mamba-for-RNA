@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Build the indexed 3M ncRNA + 3M coding-RNA pretraining corpus.
+"""Build the indexed 3M ncRNA + approximately 2M coding-RNA corpus.
 
-The input is the delivery archive described in ``docs/PRETRAINING_6M.md``.
+The input is the delivery archive described in ``docs/PRETRAINING_5M.md``.
 Sequences are streamed and written to memory-mappable files; the complete
-six-million-record corpus is never materialised as Python strings in RAM.
+five-million-record corpus is never materialised as Python strings in RAM.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from pathlib import Path, PurePosixPath
 from typing import Iterable, Iterator, Optional
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SOURCE_CODES = {"ncRNA": 0, "coding": 1}
 PROGRESS_INTERVAL = 100_000
 
@@ -90,6 +90,13 @@ def find_member(archive: zipfile.ZipFile, basename: str) -> str:
             f"Expected exactly one {basename!r} in the bundle, found {len(matches)}"
         )
     return matches[0]
+
+
+def find_optional_member(archive: zipfile.ZipFile, basename: str) -> Optional[str]:
+    matches = [name for name in archive.namelist() if PurePosixPath(name).name == basename]
+    if len(matches) > 1:
+        raise ValueError(f"Expected at most one {basename!r} in the bundle, found {len(matches)}")
+    return matches[0] if matches else None
 
 
 def nested_archives(archive: zipfile.ZipFile, prefix: str) -> list[str]:
@@ -277,45 +284,44 @@ def process_fasta_to_primary(
                 audit[f"{source_type}:accepted"] += 1
 
 
-def process_human_master(
-    outer: zipfile.ZipFile,
-    member: str,
+def process_transcript_master(
+    compressed_handle,
     spool_handle,
     reservoir: ReservoirOffsets,
     seen_hashes: set[bytes],
+    source_type: str,
+    species: str,
     min_length: int,
     max_length: int,
     audit: Counter,
 ) -> None:
-    with outer.open(member) as compressed:
-        with gzip.GzipFile(fileobj=compressed, mode="rb") as raw:
-            with io.TextIOWrapper(raw, encoding="utf-8", newline="") as text:
-                reader = csv.DictReader(text)
-                if not reader.fieldnames or "transcript_sequence" not in reader.fieldnames:
-                    raise ValueError(f"{member} has no transcript_sequence column")
-                id_field = "transcript_id" if "transcript_id" in reader.fieldnames else reader.fieldnames[0]
-                for row_number, row in enumerate(reader, start=2):
-                    source_type = "human_full_mrna"
-                    audit[f"{source_type}:seen"] += 1
-                    if audit[f"{source_type}:seen"] % PROGRESS_INTERVAL == 0:
-                        progress(
-                            source_type,
-                            audit[f"{source_type}:seen"],
-                            audit[f"{source_type}:accepted"],
-                        )
-                    sequence, reason = normalize_rna(row["transcript_sequence"], min_length, max_length)
-                    if reason:
-                        audit[f"{source_type}:excluded_{reason}"] += 1
-                        continue
-                    digest = content_digest(sequence)
-                    if digest in seen_hashes:
-                        audit[f"{source_type}:excluded_duplicate"] += 1
-                        continue
-                    seen_hashes.add(digest)
-                    identifier = row.get(id_field) or f"human_row_{row_number}"
-                    offset = write_spool_record(spool_handle, source_type, "Homo_sapiens", identifier, sequence)
-                    reservoir.add(offset)
-                    audit[f"{source_type}:accepted"] += 1
+    with gzip.GzipFile(fileobj=compressed_handle, mode="rb") as raw:
+        with io.TextIOWrapper(raw, encoding="utf-8", newline="") as text:
+            reader = csv.DictReader(text)
+            if not reader.fieldnames or "transcript_sequence" not in reader.fieldnames:
+                raise ValueError(f"{source_type} master has no transcript_sequence column")
+            id_field = "transcript_id" if "transcript_id" in reader.fieldnames else reader.fieldnames[0]
+            for row_number, row in enumerate(reader, start=2):
+                audit[f"{source_type}:seen"] += 1
+                if audit[f"{source_type}:seen"] % PROGRESS_INTERVAL == 0:
+                    progress(
+                        source_type,
+                        audit[f"{source_type}:seen"],
+                        audit[f"{source_type}:accepted"],
+                    )
+                sequence, reason = normalize_rna(row["transcript_sequence"], min_length, max_length)
+                if reason:
+                    audit[f"{source_type}:excluded_{reason}"] += 1
+                    continue
+                digest = content_digest(sequence)
+                if digest in seen_hashes:
+                    audit[f"{source_type}:excluded_duplicate"] += 1
+                    continue
+                seen_hashes.add(digest)
+                identifier = row.get(id_field) or f"{source_type}_row_{row_number}"
+                offset = write_spool_record(spool_handle, source_type, species, identifier, sequence)
+                reservoir.add(offset)
+                audit[f"{source_type}:accepted"] += 1
 
 
 def process_euk_cds_candidates(
@@ -385,7 +391,7 @@ def prepare_corpus(args: argparse.Namespace) -> dict:
     audit: Counter = Counter()
 
     try:
-        with tempfile.TemporaryDirectory(prefix="rna_pretraining_6m_", dir=args.temp_dir) as temp_name:
+        with tempfile.TemporaryDirectory(prefix="rna_pretraining_5m_", dir=args.temp_dir) as temp_name:
             temp_dir = Path(temp_name)
             primary_spool = temp_dir / "coding_primary.tsv"
             filler_spool = temp_dir / "coding_filler.tsv"
@@ -397,6 +403,19 @@ def prepare_corpus(args: argparse.Namespace) -> dict:
                 print(f"[bundle] auditing {bundle_path}", flush=True)
                 nc_member = find_member(outer, "rnacentral_active_mRNA100_priority_3M.fasta.gz")
                 human_member = find_member(outer, "human_transcript_master.csv.gz")
+                bundled_mouse_member = find_optional_member(outer, "mouse_transcript_master.csv.gz")
+                mouse_master_arg = getattr(args, "mouse_transcript_master", None)
+                mouse_master_path = (
+                    Path(mouse_master_arg).expanduser().resolve()
+                    if mouse_master_arg
+                    else None
+                )
+                if mouse_master_path is not None and not mouse_master_path.exists():
+                    raise FileNotFoundError(mouse_master_path)
+                if mouse_master_path is None and bundled_mouse_member is None:
+                    raise ValueError(
+                        "Missing mouse_transcript_master.csv.gz; pass --mouse-transcript-master"
+                    )
                 euk_members = nested_archives(outer, "eukaryote_mRNA_dataset_part")
                 prok_members = nested_archives(outer, "prokaryote_mRNA_dataset")
                 if not euk_members or not prok_members:
@@ -419,16 +438,45 @@ def prepare_corpus(args: argparse.Namespace) -> dict:
                                 args.max_length,
                                 audit,
                             )
-                    process_human_master(
-                        outer,
-                        human_member,
-                        spool,
-                        primary_reservoir,
-                        seen_coding_hashes,
-                        args.min_length,
-                        args.max_length,
-                        audit,
-                    )
+                    with outer.open(human_member) as compressed:
+                        process_transcript_master(
+                            compressed,
+                            spool,
+                            primary_reservoir,
+                            seen_coding_hashes,
+                            "human_full_mrna",
+                            "Homo_sapiens",
+                            args.min_length,
+                            args.max_length,
+                            audit,
+                        )
+                    if mouse_master_path is not None:
+                        with mouse_master_path.open("rb") as compressed:
+                            process_transcript_master(
+                                compressed,
+                                spool,
+                                primary_reservoir,
+                                seen_coding_hashes,
+                                "mouse_full_mrna",
+                                "Mus_musculus",
+                                args.min_length,
+                                args.max_length,
+                                audit,
+                            )
+                    else:
+                        assert bundled_mouse_member is not None
+                        with outer.open(bundled_mouse_member) as compressed:
+                            process_transcript_master(
+                                compressed,
+                                spool,
+                                primary_reservoir,
+                                seen_coding_hashes,
+                                "mouse_full_mrna",
+                                "Mus_musculus",
+                                args.min_length,
+                                args.max_length,
+                                audit,
+                            )
                     for nested_path in nested_prok_paths:
                         with zipfile.ZipFile(nested_path) as nested:
                             process_fasta_to_primary(
@@ -451,21 +499,34 @@ def prepare_corpus(args: argparse.Namespace) -> dict:
                         copy_selected_spool(primary_spool, selected_primary, output)
                     filler_count = 0
                 else:
-                    filler_count = args.target_coding - primary_count
-                    print(f"[coding-filler] selecting {filler_count:,} eukaryotic CDS views", flush=True)
-                    selected_filler = process_euk_cds_candidates(
-                        nested_euk_paths,
-                        filler_spool,
-                        filler_count,
-                        args.min_length,
-                        args.max_length,
-                        args.seed + 29,
-                        audit,
-                    )
-                    with selected_coding_spool.open("wb") as output:
-                        with primary_spool.open("rb") as primary:
-                            shutil.copyfileobj(primary, output, length=16 * 1024 * 1024)
-                        copy_selected_spool(filler_spool, selected_filler, output)
+                    shortfall = args.target_coding - primary_count
+                    if getattr(args, "fill_coding_shortfall_with_cds", False):
+                        filler_count = shortfall
+                        print(f"[coding-filler] selecting {filler_count:,} eukaryotic CDS views", flush=True)
+                        selected_filler = process_euk_cds_candidates(
+                            nested_euk_paths,
+                            filler_spool,
+                            filler_count,
+                            args.min_length,
+                            args.max_length,
+                            args.seed + 29,
+                            audit,
+                        )
+                        with selected_coding_spool.open("wb") as output:
+                            with primary_spool.open("rb") as primary:
+                                shutil.copyfileobj(primary, output, length=16 * 1024 * 1024)
+                            copy_selected_spool(filler_spool, selected_filler, output)
+                    else:
+                        filler_count = 0
+                        print(
+                            f"[coding-primary] using all {primary_count:,} independent records; "
+                            f"leaving requested quota short by {shortfall:,} rather than duplicating CDS views",
+                            flush=True,
+                        )
+                        with selected_coding_spool.open("wb") as output:
+                            copy_selected_spool(primary_spool, sorted(primary_reservoir.offsets), output)
+
+                selected_coding_count = min(primary_count, args.target_coding) + filler_count
 
                 writers = {
                     split: IndexedSplitWriter(build_dir, split)
@@ -517,9 +578,9 @@ def prepare_corpus(args: argparse.Namespace) -> dict:
                             coding_accepted += 1
                             if coding_accepted % PROGRESS_INTERVAL == 0:
                                 progress("write_coding", coding_accepted, coding_accepted)
-                    if coding_accepted != args.target_coding:
+                    if coding_accepted != selected_coding_count:
                         raise ValueError(
-                            f"Expected {args.target_coding:,} coding records, wrote {coding_accepted:,}"
+                            f"Expected {selected_coding_count:,} coding records, wrote {coding_accepted:,}"
                         )
                 finally:
                     for writer in writers.values():
@@ -529,14 +590,16 @@ def prepare_corpus(args: argparse.Namespace) -> dict:
                 "schema_version": SCHEMA_VERSION,
                 "task": "same-position masked language modelling of coding and non-coding RNA",
                 "corpus_contract": {
-                    "target_records": args.target_ncrna + args.target_coding,
+                    "requested_target_records": args.target_ncrna + args.target_coding,
                     "target_ncrna": args.target_ncrna,
                     "target_coding": args.target_coding,
+                    "selected_coding_records": selected_coding_count,
                     "coding_primary_records": min(primary_count, args.target_coding),
                     "coding_cds_view_fillers": filler_count,
+                    "coding_shortfall_from_requested_target": args.target_coding - selected_coding_count,
                     "coding_policy": (
-                        "Prefer unique complete eukaryotic/human mRNA and prokaryotic CDS; "
-                        "fill only the remaining coding quota with unique eukaryotic CDS views."
+                        "Prefer unique complete eukaryotic, human and mouse mRNA plus prokaryotic CDS. "
+                        "Do not duplicate eukaryotic CDS views unless explicitly requested."
                     ),
                     "m6a_used": False,
                     "m6a_note": "Methylation tables are reserved for downstream fine-tuning.",
@@ -547,7 +610,7 @@ def prepare_corpus(args: argparse.Namespace) -> dict:
                     "max_length": args.max_length,
                     "alphabet": "AUCGN",
                     "dna_to_rna_normalization": "T->U",
-                    "coding_content_deduplication": "within primary and CDS-view pools",
+                    "coding_content_deduplication": "content deduplication across all primary coding sources",
                     "ncrna_policy": "preserve the delivered seeded RNAcentral record selection",
                     "truncate_sequences": False,
                 },
@@ -561,6 +624,11 @@ def prepare_corpus(args: argparse.Namespace) -> dict:
                 "splits": {split: writers[split].manifest_entry() for split in writers},
                 "audit": dict(sorted(audit.items())),
                 "input_bundle": str(bundle_path),
+                "input_mouse_transcript_master": (
+                    str(mouse_master_path)
+                    if mouse_master_path is not None
+                    else f"{bundle_path}::{bundled_mouse_member}"
+                ),
             }
             manifest["totals"] = {
                 "records": sum(entry["records"] for entry in manifest["splits"].values()),
@@ -597,7 +665,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--temp-dir", default=None, help="Temporary disk with at least 40 GB free")
     parser.add_argument("--target-ncrna", type=int, default=3_000_000)
-    parser.add_argument("--target-coding", type=int, default=3_000_000)
+    parser.add_argument("--target-coding", type=int, default=2_000_000)
+    parser.add_argument(
+        "--mouse-transcript-master",
+        default=None,
+        help="External mouse_transcript_master.csv.gz (used when it is not inside the bundle)",
+    )
+    parser.add_argument(
+        "--fill-coding-shortfall-with-cds",
+        action="store_true",
+        help="Opt in to filling a coding shortfall with labelled eukaryotic CDS views",
+    )
     parser.add_argument("--min-length", type=int, default=18)
     parser.add_argument("--max-length", type=int, default=10_240)
     parser.add_argument("--train-fraction", type=float, default=0.98)

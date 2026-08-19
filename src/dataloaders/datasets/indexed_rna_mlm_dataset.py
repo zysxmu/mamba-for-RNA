@@ -18,7 +18,7 @@ class IndexedRNAMLMDataset(torch.utils.data.Dataset):
     process while retaining random access for the distributed sampler.
     """
 
-    SCHEMA_VERSION = 1
+    SUPPORTED_SCHEMA_VERSIONS = {1, 2}
 
     def __init__(
         self,
@@ -43,10 +43,11 @@ class IndexedRNAMLMDataset(torch.utils.data.Dataset):
             raise FileNotFoundError(f"Missing indexed-corpus manifest: {manifest_path}")
         with manifest_path.open("r", encoding="utf-8") as handle:
             manifest = json.load(handle)
-        if int(manifest.get("schema_version", -1)) != self.SCHEMA_VERSION:
+        schema_version = int(manifest.get("schema_version", -1))
+        if schema_version not in self.SUPPORTED_SCHEMA_VERSIONS:
             raise ValueError(
                 f"Unsupported indexed-corpus schema {manifest.get('schema_version')}; "
-                f"expected {self.SCHEMA_VERSION}"
+                f"expected one of {sorted(self.SUPPORTED_SCHEMA_VERSIONS)}"
             )
         if self.split not in manifest.get("splits", {}):
             raise ValueError(f"Manifest does not define split {self.split!r}")

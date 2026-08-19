@@ -1,54 +1,57 @@
-# Six-million-sequence RNA-Mamba pretraining
+# Five-million-sequence RNA-Mamba pretraining
 
 This document is the authoritative recipe for the next pretraining run. The
-scope is pretraining only: approximately three million non-coding RNA records
-and three million coding-RNA records. The m6A tables in the delivery archive
+scope is pretraining only: three million non-coding RNA records and
+approximately two million coding-RNA records. The m6A tables in the delivery
 are deliberately reserved for later fine-tuning.
 
 ## 1. Delivered data and the final corpus contract
 
-The source archive is `生信.zip`. Its relevant pretraining contents are:
+The sources are `生信.zip` plus the newly supplied
+`mouse_transcript_master.csv.gz`. Their relevant pretraining contents are:
 
-| Source | Delivered content | Role in the 6M corpus |
+| Source | Delivered content | Role in the 5M corpus |
 | --- | --- | --- |
 | RNAcentral selection | exactly 3,000,000 records selected from 40,712,942 active RNAcentral records; seed 2357; lengths 18--10,240 nt | 3M non-coding RNA records |
-| Eukaryote archives | 45 species and 1,532,392 protein-coding full-mRNA transcript records, with matching CDS/UTR FASTA files | primary coding records; CDS can supply secondary views |
+| Eukaryote archives | 45 species and 1,532,392 protein-coding full-mRNA transcript records, with matching CDS/UTR FASTA files | primary coding records |
 | Prokaryote archive | 51 species and 149,969 coding records, primarily CDS | primary coding records |
 | Human transcript master | 211,446 full-transcript rows with `5'UTR + CDS + 3'UTR` sequences and coordinates | primary coding records |
-| Human/mouse m6A tables and m6A archive | nucleotide modification labels | **not used in pretraining**; retained for fine-tuning |
+| Mouse transcript master | 59,294 full-transcript rows, 21,807 genes and 144,128,429 nt; all IDs agree with its exon table | primary coding records |
+| Human/mouse m6A tables and m6A archive | nucleotide modification labels; the mouse mask covers 48,352 master transcripts | **not used in pretraining**; retained for fine-tuning |
 
-The archive therefore does not contain three million distinct full-length mRNA
-records. The preparation code uses this explicit policy instead of duplicating
-records or silently calling CDS sequences full mRNA:
+The independent coding sources contain 1,953,101 raw records before filtering:
+1,532,392 eukaryotic full mRNAs, 211,446 human full mRNAs, 59,294 mouse full
+mRNAs and 149,969 prokaryotic coding records. The preparation code uses this
+explicit policy:
 
-1. keep valid unique eukaryotic full mRNA, human full mRNA, and prokaryotic CDS
+1. keep valid unique eukaryotic, human and mouse full mRNA plus prokaryotic CDS
    as primary coding records;
-2. if those records do not reach 3M after length/alphabet checks, draw a seeded
-   sample of unique eukaryotic CDS sequences as `eukaryote_cds_view` records;
-3. stop at exactly 3M coding records;
-4. combine them with the delivered 3M RNAcentral records;
-5. write the exact source type of every record to compressed metadata.
+2. exclude invalid, duplicate and out-of-range records without replacing them
+   with repeated views of the same transcript;
+3. use at most 2M coding records and combine them with the delivered 3M
+   RNAcentral records;
+4. write the exact source type of every record to compressed metadata.
 
-This distinction must remain in the methods section: the coding half is a
-three-million-record coding-sequence corpus, not three million independent
-full-length mRNAs.
+Consequently, "2M coding" is a rounded planning label. The exact usable count
+after quality control is recorded in `manifest.json`; it must not be reported
+as two million independent full-length mRNAs unless the manifest actually
+contains that count.
 
 All sequences are upper-cased, `T` is converted to `U`, the accepted alphabet
 is `A/U/C/G/N`, and lengths outside 18--10,240 nt are excluded. Sequences are
-never truncated. Primary coding records and CDS-view records are
-content-deduplicated within their respective representation pools. A CDS view
-may legitimately have the same sequence as its full-mRNA view, but both are
-labelled as such and are assigned to the same split. The already curated
-RNAcentral 3M record selection is preserved at accession level.
+never truncated. Primary coding records are content-deduplicated across all
+sources. The already curated RNAcentral 3M record selection is preserved at
+accession level. An optional CDS-view filler exists only for a controlled
+ablation and is disabled in the formal recipe.
 
 ## 2. Why the indexed format is required
 
-The older data loader stored every RNA sequence as a Python string. With six
+The older data loader stored every RNA sequence as a Python string. With five
 million records and eight DDP processes, that would duplicate the corpus in
 host memory eight times. The new preparation script writes:
 
 ```text
-rna_pretraining_6m/
+rna_pretraining_5m/
   manifest.json
   train.sequences.bin
   train.offsets.u64
@@ -75,18 +78,20 @@ cd /path/to/mamba-for-RNA
 conda activate rna-mamba
 
 BUNDLE=/path/to/生信.zip
-DATA_DIR=/path/to/data/processed/rna_pretraining_6m
+MOUSE_MASTER=/path/to/mouse_transcript_master.csv.gz
+DATA_DIR=/path/to/data/processed/rna_pretraining_5m
 TEMP_DIR=/path/to/fast-temporary-storage
 
-python scripts/prepare_pretraining_6m.py \
+python scripts/prepare_pretraining_5m.py \
   --bundle "$BUNDLE" \
+  --mouse-transcript-master "$MOUSE_MASTER" \
   --output-dir "$DATA_DIR" \
   --temp-dir "$TEMP_DIR" \
-  2>&1 | tee /path/to/prepare_pretraining_6m.log
+  2>&1 | tee /path/to/prepare_pretraining_5m.log
 ```
 
 Preparation is transactional. Files are first created under
-`rna_pretraining_6m.building` and moved into place only after every count and
+`rna_pretraining_5m.building` and moved into place only after every count and
 file-size check succeeds. Pass `--overwrite` only when intentionally replacing
 an existing prepared corpus.
 
@@ -98,23 +103,20 @@ import json
 import sys
 
 d = json.load(open(sys.argv[1], encoding="utf-8"))
-assert d["schema_version"] == 1
-assert d["totals"]["records"] == 6_000_000
-assert d["totals"]["source_class_counts"] == {
-    "ncRNA": 3_000_000,
-    "coding": 3_000_000,
-}
+assert d["schema_version"] == 2
+assert d["totals"]["source_class_counts"]["ncRNA"] == 3_000_000
+assert 1_500_000 <= d["totals"]["source_class_counts"]["coding"] <= 2_000_000
+assert d["corpus_contract"]["coding_cds_view_fillers"] == 0
 assert d["corpus_contract"]["m6a_used"] is False
 print(json.dumps(d["corpus_contract"], indent=2))
 print(json.dumps(d["splits"], indent=2))
-print("6M pretraining data audit: PASS")
+print("5M planning-corpus data audit: PASS")
 PY
 ```
 
-The default split is stable 98%/1%/1% assignment. Full-mRNA and CDS views of
-the same species/transcript identifier are always placed in the same split.
-It produces approximately
-5.88M training records and 60k records in each evaluation split. The exact
+The default split is stable 98%/1%/1% assignment by biological record. It
+produces approximately 4.85M training records if all 1.95M coding records pass
+quality control. The exact
 counts are recorded in `manifest.json`; training never relies on an estimated
 count.
 
@@ -136,7 +138,7 @@ Run a short one-GPU smoke job before allocating an eight-GPU node:
 export RNA_PRETRAIN_INDEXED_DIR="$DATA_DIR"
 
 CUDA_VISIBLE_DEVICES=0 python -m train \
-  experiment=rna_6m_pretrain \
+  experiment=rna_5m_pretrain \
   trainer.devices=1 \
   trainer.max_steps=20 \
   trainer.accumulate_grad_batches=1 \
@@ -148,7 +150,7 @@ CUDA_VISIBLE_DEVICES=0 python -m train \
   callbacks.model_checkpoint_every_n_steps.save_top_k=0 \
   train.test=false \
   wandb=null \
-  hydra.run.dir=runs/rna_6m_smoke
+  hydra.run.dir=runs/rna_5m_smoke
 ```
 
 ## 5. Formal eight-GPU launch
@@ -177,8 +179,8 @@ memory configuration. m6A labels are not inputs or targets in this stage.
 cd /path/to/mamba-for-RNA
 conda activate rna-mamba
 
-export RNA_PRETRAIN_INDEXED_DIR=/path/to/data/processed/rna_pretraining_6m
-export RUN_DIR=/path/to/runs/rna_pretraining_6m
+export RNA_PRETRAIN_INDEXED_DIR=/path/to/data/processed/rna_pretraining_5m
+export RUN_DIR=/path/to/runs/rna_pretraining_5m
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export NUM_DEVICES=8
 export BATCH_SIZE=1
@@ -186,7 +188,7 @@ export GRAD_ACCUM=2
 export NUM_WORKERS=4
 export PRETRAIN_EPOCHS=2
 
-bash scripts/run_pretrain_6m_8gpu.sh
+bash scripts/run_pretrain_5m_8gpu.sh
 ```
 
 The launcher calculates the optimizer-step target from the actual manifest:
@@ -197,10 +199,12 @@ steps per epoch = ceil(training records / global batch)
 max steps = steps per epoch x PRETRAIN_EPOCHS
 ```
 
-For an approximately 5.88M-record training split and global batch 16, this is
-about 367,500 optimizer steps per epoch and 735,000 steps for two epochs. The
-old 50,000-step setting is only about 0.14 epoch on this corpus and is not a
-complete training pass.
+For an approximately 4.85M-record training split and global batch 16, this is
+about 303,000 optimizer steps per epoch and 606,000 steps for two epochs. If
+quality control leaves exactly five million total records, the corresponding
+values are about 306,250 and 612,500 steps. The exact values printed by the
+launcher take precedence. The old 50,000-step setting is only about 0.16 epoch
+on this corpus and is not a complete training pass.
 
 Two epochs are the initial compute plan, not a claim that convergence is
 guaranteed. Select the best `val/loss` checkpoint. Add a third epoch only if
@@ -211,7 +215,7 @@ the last checkpoint merely because it is later.
 
 The teacher's earlier eight-H200 run on the much smaller mixed corpus took
 about three hours for 50,000 optimizer steps. A purely linear extrapolation is
-approximately 44 hours for 735,000 steps. That is a planning estimate, not a
+approximately 36--37 hours for roughly 606,000--612,500 steps. That is a planning estimate, not a
 measurement of the new corpus: the new length distribution, storage bandwidth,
 padding, and validation set can change throughput.
 
@@ -242,19 +246,19 @@ To resume an interrupted run exactly, restore model, optimizer, scheduler and
 step state from the last checkpoint:
 
 ```bash
-export RESUME_CKPT=/path/to/runs/rna_pretraining_6m/checkpoints/last.ckpt
-bash scripts/run_pretrain_6m_8gpu.sh
+export RESUME_CKPT=/path/to/runs/rna_pretraining_5m/checkpoints/last.ckpt
+bash scripts/run_pretrain_5m_8gpu.sh
 ```
 
 Keep these outputs:
 
 ```text
-data/processed/rna_pretraining_6m/manifest.json
-runs/rna_pretraining_6m/run_manifest.txt
-runs/rna_pretraining_6m/console.log
-runs/rna_pretraining_6m/time.txt
-runs/rna_pretraining_6m/checkpoints_best/val_loss.ckpt
-runs/rna_pretraining_6m/checkpoints/last.ckpt
+data/processed/rna_pretraining_5m/manifest.json
+runs/rna_pretraining_5m/run_manifest.txt
+runs/rna_pretraining_5m/console.log
+runs/rna_pretraining_5m/time.txt
+runs/rna_pretraining_5m/checkpoints_best/val_loss.ckpt
+runs/rna_pretraining_5m/checkpoints/last.ckpt
 ```
 
 Fine-tuning is intentionally a separate later decision. At that point the m6A

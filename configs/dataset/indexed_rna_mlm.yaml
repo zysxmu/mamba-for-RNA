@@ -1,9 +1,9 @@
 _name_: full_transcript_rna_mlm
 
-# Prepared by scripts/prepare_pretraining_6m.py. Sequence bytes are memory
+# Prepared by scripts/prepare_pretraining_5m.py. Sequence bytes are memory
 # mapped lazily instead of copied into every DDP worker/process.
-data_dir: ${oc.env:RNA_PRETRAIN_INDEXED_DIR,data/processed/rna_pretraining_6m}
-indexed_data_dir: ${oc.env:RNA_PRETRAIN_INDEXED_DIR,data/processed/rna_pretraining_6m}
+data_dir: ${oc.env:RNA_PRETRAIN_INDEXED_DIR,data/processed/rna_pretraining_5m}
+indexed_data_dir: ${oc.env:RNA_PRETRAIN_INDEXED_DIR,data/processed/rna_pretraining_5m}
 
 ncrna_fasta: null
 include_ncrna: false

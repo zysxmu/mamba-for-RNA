@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Formal pretraining-only launcher for the prepared 3M ncRNA + 3M coding-RNA
+# Formal pretraining-only launcher for the prepared 3M ncRNA + ~2M coding-RNA
 # corpus. Run this script inside an allocated 8-GPU node.
 
 ROOT_DIR="${ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-DATA_DIR="${RNA_PRETRAIN_INDEXED_DIR:-$ROOT_DIR/data/processed/rna_pretraining_6m}"
-RUN_DIR="${RUN_DIR:-$ROOT_DIR/runs/rna_pretraining_6m}"
+DATA_DIR="${RNA_PRETRAIN_INDEXED_DIR:-$ROOT_DIR/data/processed/rna_pretraining_5m}"
+RUN_DIR="${RUN_DIR:-$ROOT_DIR/runs/rna_pretraining_5m}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 NUM_DEVICES="${NUM_DEVICES:-8}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
@@ -15,11 +15,12 @@ NUM_WORKERS="${NUM_WORKERS:-4}"
 PRETRAIN_EPOCHS="${PRETRAIN_EPOCHS:-2}"
 WARMUP_STEPS="${WARMUP_STEPS:-20000}"
 RESUME_CKPT="${RESUME_CKPT:-}"
+MIN_CODING_RECORDS="${MIN_CODING_RECORDS:-1500000}"
 
 MANIFEST="$DATA_DIR/manifest.json"
 if [[ ! -f "$MANIFEST" ]]; then
   echo "Missing prepared-corpus manifest: $MANIFEST" >&2
-  echo "Run scripts/prepare_pretraining_6m.py first." >&2
+  echo "Run scripts/prepare_pretraining_5m.py first." >&2
   exit 2
 fi
 if [[ "$NUM_DEVICES" -le 0 || "$BATCH_SIZE" -le 0 || "$GRAD_ACCUM" -le 0 ]]; then
@@ -46,8 +47,9 @@ print(
 PY
 )
 
-if [[ "$NCRNA_RECORDS" -ne 3000000 || "$CODING_RECORDS" -ne 3000000 ]]; then
-  echo "Refusing formal run: expected 3M ncRNA + 3M coding records." >&2
+if [[ "$NCRNA_RECORDS" -ne 3000000 || "$CODING_RECORDS" -lt "$MIN_CODING_RECORDS" || "$CODING_RECORDS" -gt 2000000 ]]; then
+  echo "Refusing formal run: expected 3M ncRNA + approximately 2M independent coding records." >&2
+  echo "Allowed coding range: $MIN_CODING_RECORDS..2000000" >&2
   echo "Manifest reports ncRNA=$NCRNA_RECORDS coding=$CODING_RECORDS" >&2
   exit 2
 fi
@@ -111,7 +113,7 @@ echo "  output: $RUN_DIR"
 
 /usr/bin/time -v -o "$RUN_DIR/time.txt" \
   python -m train \
-    experiment=rna_6m_pretrain \
+    experiment=rna_5m_pretrain \
     trainer.devices="$NUM_DEVICES" \
     trainer.accelerator=gpu \
     trainer.max_epochs=null \
