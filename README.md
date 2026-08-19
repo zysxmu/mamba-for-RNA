@@ -26,9 +26,15 @@ resource estimate, and resume procedure are documented in
 Minimal entry points:
 
 ```bash
-python scripts/prepare_pretraining_5m.py \
-  --bundle /path/to/生信.zip \
+python scripts/organize_rna_data.py \
+  --delivery-archive /path/to/source_delivery.zip \
   --mouse-transcript-master /path/to/mouse_transcript_master.csv.gz \
+  --mouse-m6a-mask /path/to/mouse_m6a_nt_mask_full_mrna.csv.gz \
+  --mouse-exon-map /path/to/mouse_exon_coordinate_map.csv.gz \
+  --output-dir /path/to/rna_mamba_data
+
+python scripts/prepare_pretraining_5m.py \
+  --source-dir /path/to/rna_mamba_data \
   --output-dir /path/to/data/processed/rna_pretraining_5m \
   --temp-dir /path/to/fast-temporary-storage
 

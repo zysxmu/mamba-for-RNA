@@ -53,7 +53,7 @@ def _fasta(records: list[tuple[str, str]]) -> bytes:
     return "".join(f">{identifier}\n{sequence}\n" for identifier, sequence in records).encode()
 
 
-def _synthetic_bundle(path, *, include_mouse: bool = True) -> bytes:
+def _synthetic_source_dir(path) -> None:
     euk = _zip_bytes(
         {
             "euk/Species_A/mrna.fa": _fasta(
@@ -80,25 +80,33 @@ def _synthetic_bundle(path, *, include_mouse: bool = True) -> bytes:
     ncrna = _fasta(
         [("n1", "AAAAUUUU"), ("n2", "CCCCGGGG"), ("n3", "AUCGAUCG"), ("n4", "NNNNAAAA")]
     )
-    mouse_compressed = gzip.compress(mouse_text.getvalue().encode())
-    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as outer:
-        outer.writestr("eukaryote_mRNA_dataset_part1.zip", euk)
-        outer.writestr("prokaryote_mRNA_dataset.zip", prok)
-        outer.writestr("human_transcript_master.csv.gz", gzip.compress(human_text.getvalue().encode()))
-        if include_mouse:
-            outer.writestr("mouse_transcript_master.csv.gz", mouse_compressed)
-        outer.writestr("rnacentral_active_mRNA100_priority_3M.fasta.gz", gzip.compress(ncrna))
-        # These labels are intentionally present but must not enter pretraining.
-        outer.writestr("human_m6a_nt_mask_full_mrna.csv.gz", gzip.compress(b"mask\n"))
-    return mouse_compressed
+    files = {
+        "pretraining/coding_rna/eukaryote/eukaryote_mRNA_dataset_part1.zip": euk,
+        "pretraining/coding_rna/prokaryote/prokaryote_mRNA_dataset.zip": prok,
+        "pretraining/coding_rna/human/human_transcript_master.csv.gz": gzip.compress(
+            human_text.getvalue().encode()
+        ),
+        "pretraining/coding_rna/mouse/mouse_transcript_master.csv.gz": gzip.compress(
+            mouse_text.getvalue().encode()
+        ),
+        "pretraining/non_coding_rna/rnacentral_active_mRNA100_priority_3M.fasta.gz": gzip.compress(
+            ncrna
+        ),
+        # This label file is intentionally present but must not enter pretraining.
+        "finetuning/m6a/human/human_m6a_nt_mask_full_mrna.csv.gz": gzip.compress(b"mask\n"),
+    }
+    for relative_path, content in files.items():
+        destination = path / relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content)
 
 
 def test_prepare_and_read_indexed_five_million_style_corpus(tmp_path):
-    bundle = tmp_path / "bundle.zip"
+    source_dir = tmp_path / "rna_mamba_data"
     output = tmp_path / "prepared"
-    _synthetic_bundle(bundle)
+    _synthetic_source_dir(source_dir)
     args = argparse.Namespace(
-        bundle=str(bundle),
+        source_dir=str(source_dir),
         output_dir=str(output),
         temp_dir=str(tmp_path),
         target_ncrna=4,
@@ -166,11 +174,11 @@ def test_prepare_and_read_indexed_five_million_style_corpus(tmp_path):
 
 
 def test_indexed_manifest_records_m6a_exclusion(tmp_path):
-    bundle = tmp_path / "bundle.zip"
+    source_dir = tmp_path / "rna_mamba_data"
     output = tmp_path / "prepared"
-    _synthetic_bundle(bundle)
+    _synthetic_source_dir(source_dir)
     args = argparse.Namespace(
-        bundle=str(bundle),
+        source_dir=str(source_dir),
         output_dir=str(output),
         temp_dir=str(tmp_path),
         target_ncrna=4,
@@ -186,31 +194,3 @@ def test_indexed_manifest_records_m6a_exclusion(tmp_path):
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["corpus_contract"]["m6a_used"] is False
     assert all("m6a" not in key.lower() for key in manifest["audit"])
-
-
-def test_prepare_accepts_external_mouse_master(tmp_path):
-    bundle = tmp_path / "bundle.zip"
-    mouse_master = tmp_path / "mouse_transcript_master.csv.gz"
-    mouse_master.write_bytes(_synthetic_bundle(bundle, include_mouse=False))
-    output = tmp_path / "prepared"
-    args = argparse.Namespace(
-        bundle=str(bundle),
-        mouse_transcript_master=str(mouse_master),
-        output_dir=str(output),
-        temp_dir=str(tmp_path),
-        target_ncrna=4,
-        target_coding=7,
-        min_length=4,
-        max_length=32,
-        train_fraction=0.7,
-        val_fraction=0.15,
-        seed=1,
-        overwrite=False,
-    )
-    manifest = prepare_corpus(args)
-    assert manifest["totals"]["source_class_counts"]["coding"] == 7
-    assert manifest["input_mouse_transcript_master"] == str(mouse_master.resolve())
-    assert sum(
-        item["source_type_counts"].get("mouse_full_mrna", 0)
-        for item in manifest["splits"].values()
-    ) == 2

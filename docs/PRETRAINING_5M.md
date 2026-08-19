@@ -7,8 +7,10 @@ are deliberately reserved for later fine-tuning.
 
 ## 1. Delivered data and the final corpus contract
 
-The sources are `生信.zip` plus the newly supplied
-`mouse_transcript_master.csv.gz`. Their relevant pretraining contents are:
+The sources are the original delivery archive plus the newly supplied mouse
+master, mask and exon-map files. The archive's local display name is not part
+of the training contract. `scripts/organize_rna_data.py` converts all inputs
+once into the canonical English directory below.
 
 | Source | Delivered content | Role in the 5M corpus |
 | --- | --- | --- |
@@ -18,6 +20,32 @@ The sources are `生信.zip` plus the newly supplied
 | Human transcript master | 211,446 full-transcript rows with `5'UTR + CDS + 3'UTR` sequences and coordinates | primary coding records |
 | Mouse transcript master | 59,294 full-transcript rows, 21,807 genes and 144,128,429 nt; all IDs agree with its exon table | primary coding records |
 | Human/mouse m6A tables and m6A archive | nucleotide modification labels; the mouse mask covers 48,352 master transcripts | **not used in pretraining**; retained for fine-tuning |
+
+```text
+rna_mamba_data/
+  pretraining/
+    non_coding_rna/
+      rnacentral_active_mRNA100_priority_3M.fasta.gz
+      rnacentral_active_mRNA100_priority_3M.ids.txt
+      rnacentral_active_mRNA100_priority_3M.summary.json
+    coding_rna/
+      eukaryote/eukaryote_mRNA_dataset_part1.zip ... part4.zip
+      prokaryote/prokaryote_mRNA_dataset.zip
+      human/human_transcript_master.csv.gz
+      mouse/mouse_transcript_master.csv.gz
+  finetuning/m6a/
+    human/human_m6a_nt_mask_full_mrna.csv.gz
+    human/human_exon_coordinate_map.csv.gz
+    mouse/mouse_m6a_nt_mask_full_mrna.csv.gz
+    mouse/mouse_exon_coordinate_map.csv.gz
+    multispecies/m6A_modification_dataset.zip
+  manifests/source_inventory.json
+  documentation/delivery_readme.md
+```
+
+The exact teacher-provided basenames are preserved. Only the directory layout
+is standardized. The obsolete mouse `.textClipping` placeholder is never
+copied.
 
 The independent coding sources contain 1,953,101 raw records before filtering:
 1,532,392 eukaryotic full mRNAs, 211,446 human full mRNAs, 59,294 mouse full
@@ -66,7 +94,7 @@ random access for distributed sampling but does not load all sequence strings
 into RAM. The metadata files preserve source class, source type, species,
 record identifier, and length for every example.
 
-## 3. Prepare the data once
+## 3. Organize and prepare the data once
 
 Use a fast local or parallel filesystem with at least 40 GB of temporary free
 space and at least 30 GB for the final prepared data. Actual usage depends on
@@ -77,14 +105,24 @@ multiple distributed ranks.
 cd /path/to/mamba-for-RNA
 conda activate rna-mamba
 
-BUNDLE=/path/to/生信.zip
+DELIVERY_ARCHIVE=/path/to/source_delivery.zip
 MOUSE_MASTER=/path/to/mouse_transcript_master.csv.gz
+MOUSE_MASK=/path/to/mouse_m6a_nt_mask_full_mrna.csv.gz
+MOUSE_EXON=/path/to/mouse_exon_coordinate_map.csv.gz
+SOURCE_DIR=/path/to/rna_mamba_data
 DATA_DIR=/path/to/data/processed/rna_pretraining_5m
 TEMP_DIR=/path/to/fast-temporary-storage
 
-python scripts/prepare_pretraining_5m.py \
-  --bundle "$BUNDLE" \
+python scripts/organize_rna_data.py \
+  --delivery-archive "$DELIVERY_ARCHIVE" \
   --mouse-transcript-master "$MOUSE_MASTER" \
+  --mouse-m6a-mask "$MOUSE_MASK" \
+  --mouse-exon-map "$MOUSE_EXON" \
+  --output-dir "$SOURCE_DIR" \
+  2>&1 | tee /path/to/organize_rna_data.log
+
+python scripts/prepare_pretraining_5m.py \
+  --source-dir "$SOURCE_DIR" \
   --output-dir "$DATA_DIR" \
   --temp-dir "$TEMP_DIR" \
   2>&1 | tee /path/to/prepare_pretraining_5m.log

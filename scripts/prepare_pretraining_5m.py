@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build the indexed 3M ncRNA + approximately 2M coding-RNA corpus.
 
-The input is the delivery archive described in ``docs/PRETRAINING_5M.md``.
+The input is the canonical source directory described in ``docs/PRETRAINING_5M.md``.
 Sequences are streamed and written to memory-mappable files; the complete
 five-million-record corpus is never materialised as Python strings in RAM.
 """
@@ -29,6 +29,36 @@ from typing import Iterable, Iterator, Optional
 SCHEMA_VERSION = 2
 SOURCE_CODES = {"ncRNA": 0, "coding": 1}
 PROGRESS_INTERVAL = 100_000
+
+
+class DirectoryArchive:
+    """Expose a canonical source directory through the small ZipFile API used here."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self._members = [
+            path.relative_to(root).as_posix()
+            for path in root.rglob("*")
+            if path.is_file()
+        ]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        return None
+
+    def namelist(self) -> list[str]:
+        return self._members
+
+    def open(self, member: str):
+        return self.path_for(member).open("rb")
+
+    def path_for(self, member: str) -> Path:
+        path = (self.root / Path(member)).resolve()
+        if self.root not in path.parents:
+            raise ValueError(f"Source member escapes data root: {member}")
+        return path
 
 
 def progress(label: str, seen: int, accepted: int) -> None:
@@ -92,13 +122,6 @@ def find_member(archive: zipfile.ZipFile, basename: str) -> str:
     return matches[0]
 
 
-def find_optional_member(archive: zipfile.ZipFile, basename: str) -> Optional[str]:
-    matches = [name for name in archive.namelist() if PurePosixPath(name).name == basename]
-    if len(matches) > 1:
-        raise ValueError(f"Expected at most one {basename!r} in the bundle, found {len(matches)}")
-    return matches[0] if matches else None
-
-
 def nested_archives(archive: zipfile.ZipFile, prefix: str) -> list[str]:
     return sorted(
         name
@@ -110,6 +133,10 @@ def nested_archives(archive: zipfile.ZipFile, prefix: str) -> list[str]:
 def extract_outer_member(
     archive: zipfile.ZipFile, member: str, destination: Path
 ) -> Path:
+    if isinstance(archive, DirectoryArchive):
+        output = archive.path_for(member)
+        print(f"[source] using {output}", flush=True)
+        return output
     output = destination / PurePosixPath(member).name
     print(f"[extract] {member} -> {output}", flush=True)
     with archive.open(member) as source, output.open("wb") as target:
@@ -369,10 +396,10 @@ def process_euk_cds_candidates(
 
 
 def prepare_corpus(args: argparse.Namespace) -> dict:
-    bundle_path = Path(args.bundle).expanduser().resolve()
+    source_dir = Path(args.source_dir).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
-    if not bundle_path.exists():
-        raise FileNotFoundError(bundle_path)
+    if not source_dir.is_dir():
+        raise NotADirectoryError(source_dir)
     if args.target_ncrna <= 0 or args.target_coding <= 0:
         raise ValueError("target_ncrna and target_coding must be positive")
     if args.min_length <= 0 or args.max_length < args.min_length:
@@ -399,23 +426,11 @@ def prepare_corpus(args: argparse.Namespace) -> dict:
             seen_coding_hashes: set[bytes] = set()
             primary_reservoir = ReservoirOffsets(args.target_coding, args.seed + 11)
 
-            with zipfile.ZipFile(bundle_path) as outer:
-                print(f"[bundle] auditing {bundle_path}", flush=True)
+            with DirectoryArchive(source_dir) as outer:
+                print(f"[source-dir] auditing {source_dir}", flush=True)
                 nc_member = find_member(outer, "rnacentral_active_mRNA100_priority_3M.fasta.gz")
                 human_member = find_member(outer, "human_transcript_master.csv.gz")
-                bundled_mouse_member = find_optional_member(outer, "mouse_transcript_master.csv.gz")
-                mouse_master_arg = getattr(args, "mouse_transcript_master", None)
-                mouse_master_path = (
-                    Path(mouse_master_arg).expanduser().resolve()
-                    if mouse_master_arg
-                    else None
-                )
-                if mouse_master_path is not None and not mouse_master_path.exists():
-                    raise FileNotFoundError(mouse_master_path)
-                if mouse_master_path is None and bundled_mouse_member is None:
-                    raise ValueError(
-                        "Missing mouse_transcript_master.csv.gz; pass --mouse-transcript-master"
-                    )
+                mouse_member = find_member(outer, "mouse_transcript_master.csv.gz")
                 euk_members = nested_archives(outer, "eukaryote_mRNA_dataset_part")
                 prok_members = nested_archives(outer, "prokaryote_mRNA_dataset")
                 if not euk_members or not prok_members:
@@ -450,33 +465,18 @@ def prepare_corpus(args: argparse.Namespace) -> dict:
                             args.max_length,
                             audit,
                         )
-                    if mouse_master_path is not None:
-                        with mouse_master_path.open("rb") as compressed:
-                            process_transcript_master(
-                                compressed,
-                                spool,
-                                primary_reservoir,
-                                seen_coding_hashes,
-                                "mouse_full_mrna",
-                                "Mus_musculus",
-                                args.min_length,
-                                args.max_length,
-                                audit,
-                            )
-                    else:
-                        assert bundled_mouse_member is not None
-                        with outer.open(bundled_mouse_member) as compressed:
-                            process_transcript_master(
-                                compressed,
-                                spool,
-                                primary_reservoir,
-                                seen_coding_hashes,
-                                "mouse_full_mrna",
-                                "Mus_musculus",
-                                args.min_length,
-                                args.max_length,
-                                audit,
-                            )
+                    with outer.open(mouse_member) as compressed:
+                        process_transcript_master(
+                            compressed,
+                            spool,
+                            primary_reservoir,
+                            seen_coding_hashes,
+                            "mouse_full_mrna",
+                            "Mus_musculus",
+                            args.min_length,
+                            args.max_length,
+                            audit,
+                        )
                     for nested_path in nested_prok_paths:
                         with zipfile.ZipFile(nested_path) as nested:
                             process_fasta_to_primary(
@@ -623,12 +623,7 @@ def prepare_corpus(args: argparse.Namespace) -> dict:
                 "source_codes": SOURCE_CODES,
                 "splits": {split: writers[split].manifest_entry() for split in writers},
                 "audit": dict(sorted(audit.items())),
-                "input_bundle": str(bundle_path),
-                "input_mouse_transcript_master": (
-                    str(mouse_master_path)
-                    if mouse_master_path is not None
-                    else f"{bundle_path}::{bundled_mouse_member}"
-                ),
+                "input_source_dir": str(source_dir),
             }
             manifest["totals"] = {
                 "records": sum(entry["records"] for entry in manifest["splits"].values()),
@@ -661,16 +656,11 @@ def prepare_corpus(args: argparse.Namespace) -> dict:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bundle", required=True, help="Path to 生信.zip")
+    parser.add_argument("--source-dir", required=True, help="Canonical RNA-Mamba source-data root")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--temp-dir", default=None, help="Temporary disk with at least 40 GB free")
     parser.add_argument("--target-ncrna", type=int, default=3_000_000)
     parser.add_argument("--target-coding", type=int, default=2_000_000)
-    parser.add_argument(
-        "--mouse-transcript-master",
-        default=None,
-        help="External mouse_transcript_master.csv.gz (used when it is not inside the bundle)",
-    )
     parser.add_argument(
         "--fill-coding-shortfall-with-cds",
         action="store_true",
