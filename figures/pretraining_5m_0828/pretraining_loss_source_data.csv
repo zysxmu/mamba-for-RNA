@@ -1,0 +1,4 @@
+completed_epoch,log_epoch,global_step,train_loss,val_loss,train_perplexity,val_perplexity,elapsed
+1,0,301655,1.01,0.97408,2.94,2.87,8:45:58
+2,1,603310,0.966,0.9544,2.85,2.83,8:51:13
+3,2,904965,0.95,0.94323,2.82,2.81,8:51:12

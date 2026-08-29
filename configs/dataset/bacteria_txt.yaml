@@ -5,7 +5,7 @@ fasta_file: null      # ✅ 补上这两行
 
 dataset_name: bacteria_txt
 
-text_file: /home/zys/caduceus-main/data/data-random_15K_sequences(1).txt
+text_file: ${oc.env:BACTERIA_TEXT_FILE,data/data-random_15K_sequences.txt}
 
 max_length: 1024
 

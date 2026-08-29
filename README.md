@@ -50,6 +50,43 @@ and about 612,500 steps for the initial two-epoch plan. Because coding records
 are filtered and deduplicated, the launcher reads the exact training count
 from `manifest.json` and calculates the real values automatically.
 
+### Completed eight-GPU pretraining run
+
+The completed three-epoch BF16 run reached 904,965 optimizer steps without
+NaN, Inf, out-of-memory, or scheduler interruption. The plotted points are
+epoch-end averages rather than initialization losses: the first point follows
+301,655 optimizer steps. Epoch-level training loss
+decreased from 1.010 to 0.950 and validation loss decreased monotonically from
+0.97408 to 0.94323. The last epoch produced the best validation-loss
+checkpoint.
+
+![RNA-Mamba 5M pretraining loss](figures/pretraining_5m_0828/rna_mamba_5m_pretraining_loss.png)
+
+Editable PDF/SVG/TIFF exports and the exact CSV source data are retained in
+[`figures/pretraining_5m_0828`](figures/pretraining_5m_0828).
+
+## Current six-species m6A fine-tuning data
+
+The formal downstream task uses the six species in the delivered m6A archive:
+chimpanzee, Arabidopsis, yeast, macaque, pig, and rat. It contains 89,476
+labelled transcripts and 861,091 positive m6A sites before model-length
+filtering. Human and mouse are supported as an explicitly separate extension,
+but are not mixed into the default six-species experiment.
+
+After strict coordinate/CDS checks and the 10,240-nt cap, the verified
+train/validation/test sizes are 70,891 / 8,851 / 8,871 complete transcripts.
+
+Preparation streams directly from the canonical source archives, validates
+`complete mRNA = 5'UTR + CDS + 3'UTR`, checks every positive label is on A, and
+uses species-qualified gene- and exact-sequence-disjoint splits. Commands, per-species counts,
+label semantics, audit assertions, and the fine-tuning command are in
+[`docs/MULTISPECIES_M6A.md`](docs/MULTISPECIES_M6A.md). This remains a separate
+fine-tuning stage; its labels are not used during 5M RNA MLM pretraining.
+The final audit found 89,423 exact-sequence groups; duplicate records are kept
+in a single split.
+The formal eight-GPU entry point is
+[`scripts/run_multispecies_m6a_8gpu.sh`](scripts/run_multispecies_m6a_8gpu.sh).
+
 ## Legacy validated small-corpus workflow (8 GPUs)
 
 This older workflow records the already validated small-corpus experiments and
@@ -699,10 +736,11 @@ reported or excluded from the MLM loss.
 Run a bounded single-GPU integration test before spending a cluster allocation:
 
 ```bash
-export M6A_FULL_DATA_DIR=/home/zys/mamba-for-RNA/data/processed/human_m6a_full_transcript
-export RNA_FASTA_FILE=/home/zys/mamba-for-RNA/data/rnacentral_small_ATCG_only.fasta
-MLM_CKPT=/home/zys/mamba-for-RNA/runs/rna100_lightweight/checkpoints_best/val_loss.ckpt
-RUN_DIR=/home/zys/mamba-for-RNA/runs/rna_long_10240_benchmark
+ROOT_DIR=/path/to/mamba-for-RNA
+export M6A_FULL_DATA_DIR="$ROOT_DIR/data/processed/human_m6a_full_transcript"
+export RNA_FASTA_FILE=/path/to/rnacentral_small_ATCG_only.fasta
+MLM_CKPT=/path/to/pretraining/checkpoints_best/val_loss.ckpt
+RUN_DIR=/path/to/runs/rna_long_10240_benchmark
 mkdir -p "$RUN_DIR"
 
 CUDA_VISIBLE_DEVICES=0 /usr/bin/time -v -o "$RUN_DIR/time.txt" \
@@ -740,6 +778,11 @@ fine-tunes the complete model on labelled adenosines.
 
 ## Nucleotide-level human m6A fine-tuning
 
+> **Legacy single-species workflow.** The current production fine-tuning task
+> uses the delivered six-species m6A archive. Follow
+> [`docs/MULTISPECIES_M6A.md`](docs/MULTISPECIES_M6A.md) instead. This section
+> is retained only for reproducing the earlier human-only experiments.
+
 The full-mRNA task uses `transcript_sequence` as input and the equally long
 `m6a_nt_mask` as its target. A labelled adenosine is `1`, an unmethylated
 adenosine is `0`, and non-A bases are excluded from the loss. Preparation now
@@ -751,11 +794,12 @@ window or transcript isoform.
 Prepare and audit the three source tables:
 
 ```bash
-cd /home/zys/mamba-for-RNA
+ROOT_DIR=/path/to/mamba-for-RNA
+cd "$ROOT_DIR"
 conda activate rna-mamba
 
-SOURCE_DIR=/home/zys/gpt
-M6A_NT_DATA_DIR=/home/zys/mamba-for-RNA/data/processed/human_m6a_nucleotide
+SOURCE_DIR=/path/to/human_m6a_source_tables
+M6A_NT_DATA_DIR="$ROOT_DIR/data/processed/human_m6a_nucleotide"
 mkdir -p "$M6A_NT_DATA_DIR"
 
 python scripts/prepare_m6a_nucleotide.py \
@@ -785,9 +829,9 @@ padding-aware BiMamba reverse path reverses only each sample's valid prefix.
 First benchmark 100 optimizer steps on the A100 80GB GPU:
 
 ```bash
-export M6A_NT_DATA_DIR=/home/zys/mamba-for-RNA/data/processed/human_m6a_nucleotide
-NT_CKPT=/home/zys/mamba-for-RNA/runs/human_m6a_nucleotide_full_retry/checkpoints/val/m6a_average_precision.ckpt
-RUN_DIR=/home/zys/mamba-for-RNA/runs/human_m6a_full_10240_benchmark
+export M6A_NT_DATA_DIR=/path/to/processed/human_m6a_nucleotide
+NT_CKPT=/path/to/nucleotide/checkpoints/val/m6a_average_precision.ckpt
+RUN_DIR=/path/to/runs/human_m6a_full_10240_benchmark
 mkdir -p "$RUN_DIR"
 
 CUDA_VISIBLE_DEVICES=0 /usr/bin/time -v -o "$RUN_DIR/time.txt" \
@@ -836,12 +880,13 @@ histograms rather than retaining every adenosine score in RAM.
 The command below can run on GPU 1 while a pretraining job occupies GPU 0:
 
 ```bash
-cd /home/zys/mamba-for-RNA
+ROOT_DIR=/path/to/mamba-for-RNA
+cd "$ROOT_DIR"
 conda activate rna-mamba
 
-BEST_CKPT=/home/zys/mamba-for-RNA/runs/human_m6a_full_10240_from_long/checkpoints_best/val_m6a_ap.ckpt
-M6A_DATA=/home/zys/mamba-for-RNA/data/processed/human_m6a_full_transcript
-EVAL_DIR=/home/zys/mamba-for-RNA/runs/human_m6a_full_10240_from_long/calibrated_evaluation
+BEST_CKPT=/path/to/finetuning/checkpoints_best/val_m6a_ap.ckpt
+M6A_DATA=/path/to/processed/human_m6a_full_transcript
+EVAL_DIR=/path/to/runs/human_m6a_full_10240_from_long/calibrated_evaluation
 mkdir -p "$EVAL_DIR"
 
 CUDA_VISIBLE_DEVICES=1 /usr/bin/time -v -o "$EVAL_DIR/time.txt" \
@@ -889,9 +934,9 @@ hook loads only shape-compatible backbone tensors and deliberately leaves the
 new nucleotide classifier randomly initialized.
 
 ```bash
-export M6A_NT_DATA_DIR=/home/zys/mamba-for-RNA/data/processed/human_m6a_nucleotide
-PRETRAINED_CKPT=/home/zys/mamba-for-RNA/runs/human_m6a_full_finetune/checkpoints/val/loss.ckpt
-RUN_DIR=/home/zys/mamba-for-RNA/runs/human_m6a_nucleotide_smoke
+export M6A_NT_DATA_DIR=/path/to/processed/human_m6a_nucleotide
+PRETRAINED_CKPT=/path/to/pretraining/checkpoints_best/val_loss.ckpt
+RUN_DIR=/path/to/runs/human_m6a_nucleotide_smoke
 
 CUDA_VISIBLE_DEVICES=0 python -m train \
   experiment=human_m6a_nucleotide \
@@ -911,9 +956,9 @@ CUDA_VISIBLE_DEVICES=0 python -m train \
 After the smoke test succeeds, launch the complete single-GPU fine-tuning run:
 
 ```bash
-export M6A_NT_DATA_DIR=/home/zys/mamba-for-RNA/data/processed/human_m6a_nucleotide
-PRETRAINED_CKPT=/home/zys/mamba-for-RNA/runs/human_m6a_full_finetune/checkpoints/val/loss.ckpt
-RUN_DIR=/home/zys/mamba-for-RNA/runs/human_m6a_nucleotide_full
+export M6A_NT_DATA_DIR=/path/to/processed/human_m6a_nucleotide
+PRETRAINED_CKPT=/path/to/pretraining/checkpoints_best/val_loss.ckpt
+RUN_DIR=/path/to/runs/human_m6a_nucleotide_full
 mkdir -p "$RUN_DIR"
 
 CUDA_VISIBLE_DEVICES=0 /usr/bin/time -v -o "$RUN_DIR/time.txt" \

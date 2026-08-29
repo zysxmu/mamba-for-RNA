@@ -184,7 +184,13 @@ def organize(args: argparse.Namespace) -> dict:
             },
             "finetuning": {
                 "m6a_labels_reserved": True,
+                "formal_species": 6,
+                "formal_labelled_transcripts": 89_476,
+                "formal_positive_m6a_sites": 861_091,
+                "optional_species": ["homo_sapiens", "mus_musculus"],
+                "human_labelled_transcripts": 71_277,
                 "mouse_labelled_transcripts": 48_352,
+                "preparation_script": "scripts/prepare_multispecies_m6a.py",
             },
             "files": sorted(records, key=lambda item: item["path"]),
         }

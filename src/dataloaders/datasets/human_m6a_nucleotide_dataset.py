@@ -359,6 +359,8 @@ class HumanM6AFullTranscriptDataset(torch.utils.data.Dataset):
     def transcript_metadata(self, index: int) -> Dict[str, object]:
         record = self.records[index]
         return {
+            "species": record.get("species", "homo_sapiens"),
+            "scientific_name": record.get("scientific_name", "Homo sapiens"),
             "transcript_id": record["transcript_id"],
             "gene_id": record["gene_id"],
             "length": len(str(record["sequence"])),

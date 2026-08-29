@@ -322,14 +322,14 @@ class HumanM6AFullTranscript(SequenceDataset):
             ("test", self.dataset_test),
         ):
             print(
-                "[HumanM6AFullTranscript] "
+                "[FullTranscriptM6A] "
                 f"split={split} transcripts={len(dataset)} "
                 f"candidate_A={dataset.candidate_count} positive={dataset.positive_count} "
                 f"excluded_overlength={dataset.excluded_overlength} "
                 f"excluded_unreliable_mrna={dataset.excluded_unreliable_mrna} "
                 f"excluded_unreliable_cds={dataset.excluded_unreliable_cds}"
             )
-        print(f"[HumanM6AFullTranscript] train_pos_weight={self.positive_weight:.4f}")
+        print(f"[FullTranscriptM6A] train_pos_weight={self.positive_weight:.4f}")
 
     def _collate_fn(self, batch, *args, **kwargs):
         """Dynamically pad only to the longest transcript in this batch."""
@@ -357,3 +357,9 @@ class HumanM6AFullTranscript(SequenceDataset):
         kwargs["drop_last"] = False
         kwargs["shuffle"] = False
         return self._dataloader(self.dataset_test, batch_size=self.batch_size_eval, **kwargs)
+
+
+class MultiSpeciesM6AFullTranscript(HumanM6AFullTranscript):
+    """Full-transcript m6A loader for a unified multi-species dataset."""
+
+    _name_ = "multispecies_m6a_full"
