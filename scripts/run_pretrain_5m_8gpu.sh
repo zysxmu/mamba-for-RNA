@@ -14,6 +14,7 @@ GRAD_ACCUM="${GRAD_ACCUM:-2}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 PRETRAIN_EPOCHS="${PRETRAIN_EPOCHS:-2}"
 WARMUP_STEPS="${WARMUP_STEPS:-20000}"
+PRECISION="${PRECISION:-bf16}"
 RESUME_CKPT="${RESUME_CKPT:-}"
 MIN_CODING_RECORDS="${MIN_CODING_RECORDS:-1500000}"
 
@@ -93,6 +94,7 @@ cd "$ROOT_DIR"
   echo "steps_per_epoch=$STEPS_PER_EPOCH"
   echo "max_steps=$MAX_STEPS"
   echo "warmup_steps=$WARMUP_STEPS"
+  echo "precision=$PRECISION"
   echo "resume_checkpoint=${RESUME_CKPT:-none}"
   python --version
   if command -v nvidia-smi >/dev/null 2>&1; then
@@ -109,6 +111,7 @@ echo "Starting formal RNA-Mamba pretraining:"
 echo "  records: $TOTAL_RECORDS (train=$TRAIN_RECORDS)"
 echo "  global batch: $GLOBAL_BATCH"
 echo "  target: $PRETRAIN_EPOCHS epochs = $MAX_STEPS optimizer steps"
+echo "  precision: $PRECISION"
 echo "  output: $RUN_DIR"
 
 /usr/bin/time -v -o "$RUN_DIR/time.txt" \
@@ -116,6 +119,7 @@ echo "  output: $RUN_DIR"
     experiment=rna_5m_pretrain \
     trainer.devices="$NUM_DEVICES" \
     trainer.accelerator=gpu \
+    trainer.precision="$PRECISION" \
     trainer.max_epochs=null \
     trainer.max_steps="$MAX_STEPS" \
     trainer.accumulate_grad_batches="$GRAD_ACCUM" \

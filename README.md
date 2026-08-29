@@ -5,9 +5,362 @@ modeling. This implementation keeps the original project structure from
 commit `bea4cda9a88e4e45490cfabc425e7dd32be29483` and applies only correctness
 fixes plus a lightweight cross-layer memory path.
 
-## Current 5M-sequence pretraining plan
+## Production status and next step
 
-The current production target is **3,000,000 RNAcentral non-coding RNA
+The large-corpus RNA masked-language-model pretraining stage is complete. The
+next production task is full-model, nucleotide-level m6A fine-tuning on the
+teacher-provided six-species dataset.
+
+| Stage | Status | Formal input | Selection metric |
+| --- | --- | --- | --- |
+| RNA MLM pretraining | **Complete** | 3M RNAcentral ncRNA + approximately 2M coding RNA | minimum `val/loss` |
+| Six-species m6A preparation | **Code and data contract complete** | complete `5'UTR + CDS + 3'UTR` mRNA joined to nucleotide masks | all audits must pass |
+| Six-species m6A fine-tuning | **Run next** | best MLM checkpoint + prepared six-species records | maximum `val/m6a_average_precision` |
+| Calibrated test evaluation | Run after fine-tuning | best validation-AP checkpoint | validation-selected threshold, frozen on test |
+
+The production configuration is fixed as follows:
+
+| Item | RNA MLM pretraining | Six-species m6A fine-tuning |
+| --- | --- | --- |
+| Model | RNA-Mamba / Caduceus BiMamba, approximately 49M parameters | same pretrained backbone plus nucleotide classifier, approximately 48M trainable parameters |
+| Backbone | 12 layers, hidden size 768, tied bidirectional weights, lightweight cross-layer memory | identical backbone; all compatible weights are fine-tuned |
+| Input unit | one RNA sequence, capped at 10,240 nt | one complete mRNA (`5'UTR + CDS + 3'UTR`), capped at 10,240 nt |
+| Objective | same-position 15% masked-token prediction | binary m6A classification at A positions; non-A positions are ignored |
+| Precision | BF16 | BF16 with FP32 residual accumulation |
+| Hardware | 8 GPUs | 8 GPUs |
+| Effective global batch | 16 | 16 |
+| Optimizer / learning rate | AdamW / `8e-5` | AdamW / `2e-5` |
+| Training length | completed 3 corpus passes / 904,965 optimizer steps | start with 2 epochs and select the best validation-AP checkpoint |
+
+The formal m6A task does **not** use the earlier 128-nt sliding-window/count
+regression experiment. Each sample is a complete transcript and the model
+predicts a label at every candidate adenosine in its original transcript
+coordinate system.
+
+The completed eight-GPU BF16 pretraining run reached 904,965 optimizer steps.
+Epoch-level training loss decreased from 1.010 to 0.950 and validation loss
+decreased from 0.97408 to 0.94323. Use its best validation-loss checkpoint as
+the initialization for m6A fine-tuning; do not restart MLM pretraining unless
+performing a deliberate ablation.
+
+### 1. Pull and verify the production code
+
+```bash
+cd /path/to/mamba-for-RNA
+git pull origin main
+git status --short
+git log -1 --oneline
+conda activate rna-mamba
+```
+
+Use the current `main` branch. A clean worktree is recommended because each
+launcher records the exact Git commit and dirty-path count in its run manifest.
+
+Verify the software environment before requesting eight GPUs:
+
+```bash
+python - <<'PY'
+import causal_conv1d
+import mamba_ssm
+import torch
+
+print("torch:", torch.__version__)
+print("CUDA runtime:", torch.version.cuda)
+print("CUDA available:", torch.cuda.is_available())
+print("causal-conv1d:", getattr(causal_conv1d, "__version__", "installed"))
+print("mamba-ssm:", getattr(mamba_ssm, "__version__", "installed"))
+PY
+```
+
+The validated stack is Linux, Python 3.10, PyTorch 2.2.x,
+`causal-conv1d==1.2.0.post2`, and `mamba-ssm==1.2.2`. The launchers use BF16
+on H200-class hardware and keep residual accumulation in FP32 during m6A
+fine-tuning.
+
+### 2. Locate the completed pretraining checkpoint
+
+Set `PRETRAIN_CKPT` to the best validation-loss checkpoint from the completed
+5M run, not to a periodic checkpoint and not to `last.ckpt`:
+
+```bash
+export PRETRAIN_CKPT=/path/to/rna_pretraining_5m/checkpoints_best/val_loss.ckpt
+test -s "$PRETRAIN_CKPT"
+
+python - "$PRETRAIN_CKPT" <<'PY'
+import sys
+import torch
+
+path = sys.argv[1]
+checkpoint = torch.load(path, map_location="cpu")
+print("checkpoint:", path)
+print("epoch:", checkpoint.get("epoch"))
+print("global_step:", checkpoint.get("global_step"))
+for state in checkpoint.get("callbacks", {}).values():
+    if isinstance(state, dict) and state.get("monitor") == "val/loss":
+        print("best val/loss:", state.get("best_model_score"))
+PY
+```
+
+Expected for the completed production run: approximately 904,965 optimizer
+steps and best validation loss 0.94323.
+
+### 3. Place the six-species source archives
+
+The formal six-species experiment needs the four eukaryotic complete-mRNA
+archives and the delivered m6A mask archive in this canonical tree:
+
+```text
+/path/to/rna_mamba_data/
+  pretraining/coding_rna/eukaryote/
+    eukaryote_mRNA_dataset_part1.zip
+    eukaryote_mRNA_dataset_part2.zip
+    eukaryote_mRNA_dataset_part3.zip
+    eukaryote_mRNA_dataset_part4.zip
+  finetuning/m6a/multispecies/
+    m6A_modification_dataset.zip
+```
+
+The default formal species are chimpanzee, Arabidopsis, yeast, macaque, pig,
+and rat. Human and mouse tables are supported only as a separately named
+extension and are not silently mixed into this experiment.
+
+### 4. Build and audit the fine-tuning dataset
+
+Preparation streams from the ZIP files and does not extract the large source
+archives. It joins each mask to the corresponding complete mRNA, verifies
+`complete mRNA = 5'UTR + CDS + 3'UTR`, checks CDS coordinates, confirms that
+every positive label falls on an adenosine, and creates deterministic 80/10/10
+splits that are disjoint by both gene and exact input sequence.
+
+```bash
+export ROOT_DIR=/path/to/mamba-for-RNA
+export RNA_MAMBA_DATA_ROOT=/path/to/rna_mamba_data
+export MULTISPECIES_M6A_DATA_DIR="$RNA_MAMBA_DATA_ROOT/processed/multispecies_m6a_full_transcript"
+
+cd "$ROOT_DIR"
+mkdir -p "$RNA_MAMBA_DATA_ROOT/processed"
+
+python scripts/prepare_multispecies_m6a.py \
+  --data-root "$RNA_MAMBA_DATA_ROOT" \
+  --output-dir "$MULTISPECIES_M6A_DATA_DIR" \
+  2>&1 | tee "$RNA_MAMBA_DATA_ROOT/processed/prepare_multispecies_m6a.log"
+```
+
+Audit the generated files before allocating GPUs:
+
+```bash
+python - "$MULTISPECIES_M6A_DATA_DIR/stats.json" <<'PY'
+import json
+import sys
+
+stats = json.load(open(sys.argv[1], encoding="utf-8"))
+expected_species = {
+    "pan_troglodytes",
+    "arabidopsis_thaliana",
+    "saccharomyces_cerevisiae",
+    "macaca_mulatta",
+    "sus_scrofa",
+    "rattus_norvegicus",
+}
+assert stats["schema_version"] == 3
+assert set(stats["species"]) == expected_species
+assert stats["splitting"]["leaking_genes"] == 0
+assert stats["splitting"]["leaking_exact_sequences"] == 0
+for split in ("train", "val", "test"):
+    row = stats["combined_splits"][split]
+    print(
+        split,
+        "all=", row["transcripts"],
+        "model_ready=", row["model_10240_training_transcripts"],
+        "positive_m6a=", row["model_10240_positive_m6a"],
+    )
+print("six-species m6A audit: PASS")
+PY
+
+ls -lh \
+  "$MULTISPECIES_M6A_DATA_DIR/train.jsonl.gz" \
+  "$MULTISPECIES_M6A_DATA_DIR/val.jsonl.gz" \
+  "$MULTISPECIES_M6A_DATA_DIR/test.jsonl.gz" \
+  "$MULTISPECIES_M6A_DATA_DIR/stats.json"
+```
+
+The verified 10,240-nt model-ready counts are 70,891 training, 8,851
+validation, and 8,871 test transcripts. The training split contains 55,490,725
+candidate adenosines and 668,173 positive m6A labels. If these values differ,
+do not launch training until the source versions and audit report are checked.
+
+### 5. Run a short one-GPU smoke test
+
+The smoke test checks checkpoint compatibility, the multi-species loader,
+BF16 kernels, variable-length padding, and the nucleotide classifier without
+writing large checkpoints:
+
+```bash
+export SMOKE_RUN=/path/to/runs/multispecies_m6a_smoke
+mkdir -p "$SMOKE_RUN"
+
+CUDA_VISIBLE_DEVICES=0 python -m train \
+  experiment=multispecies_m6a_full_transcript \
+  trainer.devices=1 \
+  trainer.accelerator=gpu \
+  trainer.precision=bf16 \
+  trainer.max_epochs=1 \
+  trainer.accumulate_grad_batches=1 \
+  trainer.limit_train_batches=10 \
+  trainer.limit_val_batches=2 \
+  train.pretrained_model_path="$PRETRAIN_CKPT" \
+  train.pretrained_model_strict_load=false \
+  train.pretrained_model_state_hook._name_=load_matching_backbone \
+  train.ckpt=null \
+  train.test=false \
+  dataset.data_dir="$MULTISPECIES_M6A_DATA_DIR" \
+  dataset.max_train_transcripts=100 \
+  dataset.max_val_transcripts=16 \
+  dataset.max_test_transcripts=16 \
+  callbacks.model_checkpoint.save_top_k=0 \
+  callbacks.periodic_checkpoint.save_top_k=0 \
+  callbacks.model_checkpoint_every_n_steps.save_top_k=0 \
+  callbacks.model_checkpoint_every_n_steps.save_last=false \
+  wandb=null \
+  hydra.run.dir="$SMOKE_RUN" \
+  2>&1 | tee "$SMOKE_RUN/console.log"
+```
+
+Proceed only if this reaches `Trainer.fit stopped` without NaN, CUDA OOM,
+shape-mismatch, or missing-key errors.
+
+### 6. Launch formal eight-GPU m6A fine-tuning
+
+```bash
+export ROOT_DIR=/path/to/mamba-for-RNA
+export MULTISPECIES_M6A_DATA_DIR=/path/to/rna_mamba_data/processed/multispecies_m6a_full_transcript
+export PRETRAIN_CKPT=/path/to/rna_pretraining_5m/checkpoints_best/val_loss.ckpt
+export RUN_DIR=/path/to/runs/multispecies_m6a_full_transcript
+
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export NUM_DEVICES=8
+export BATCH_SIZE=1
+export GRAD_ACCUM=2
+export NUM_WORKERS=8
+export FINETUNE_EPOCHS=2
+export PRECISION=bf16
+
+cd "$ROOT_DIR"
+bash scripts/run_multispecies_m6a_8gpu.sh
+```
+
+This is full-model fine-tuning. It loads all shape-compatible pretrained
+backbone parameters and initializes the nucleotide m6A classifier for the new
+task. The effective global batch is `8 GPUs x 1 sequence x accumulation 2 =
+16`. The formal run uses AdamW with learning rate `2e-5`, gradient clipping
+`1.0`, automatic positive-class weighting, `residual_in_fp32=true`, and no
+cross-batch memory persistence.
+
+Start with two epochs because earlier full-transcript experiments reached the
+best validation result early and then overfit. The final model is the
+checkpoint with maximum `val/m6a_average_precision`, not automatically the
+last epoch.
+
+Monitor without changing the job:
+
+```bash
+tail -f "$RUN_DIR/console.log"
+nvidia-smi
+```
+
+The expected best checkpoint is:
+
+```text
+$RUN_DIR/checkpoints_best/val_m6a_ap.ckpt
+```
+
+On a PBS cluster, put the same exports inside the allocated job. Queue,
+project, wall-time, and log paths are site-specific; the training command is
+unchanged:
+
+```bash
+#!/usr/bin/env bash
+#PBS -q YOUR_QUEUE
+#PBS -N rna_mamba_m6a
+#PBS -l select=1
+#PBS -l walltime=37:00:00
+#PBS -P YOUR_PROJECT
+#PBS -o /path/to/logs/rna_mamba_m6a.out
+#PBS -e /path/to/logs/rna_mamba_m6a.err
+
+set -euo pipefail
+source /etc/profile.d/modules.sh
+module load cuda/12.6/12.6.1
+source ~/.bashrc
+conda activate rna-mamba
+
+export ROOT_DIR=/path/to/mamba-for-RNA
+export MULTISPECIES_M6A_DATA_DIR=/path/to/rna_mamba_data/processed/multispecies_m6a_full_transcript
+export PRETRAIN_CKPT=/path/to/rna_pretraining_5m/checkpoints_best/val_loss.ckpt
+export RUN_DIR=/path/to/runs/multispecies_m6a_full_transcript
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export NUM_DEVICES=8
+export BATCH_SIZE=1
+export GRAD_ACCUM=2
+export NUM_WORKERS=8
+export FINETUNE_EPOCHS=2
+export PRECISION=bf16
+
+cd "$ROOT_DIR"
+bash scripts/run_multispecies_m6a_8gpu.sh
+```
+
+Submit it with `qsub /path/to/job_script.sh`. Do not paste escaped Markdown
+forms such as `\#PBS`, `ROOT\_DIR`, or `&#x20;` into a shell script.
+
+### 7. Run validation-calibrated test evaluation
+
+After fine-tuning finishes, select a decision threshold only on validation and
+freeze that threshold for the gene-disjoint test set:
+
+```bash
+export BEST_M6A_CKPT="$RUN_DIR/checkpoints_best/val_m6a_ap.ckpt"
+export EVAL_DIR="$RUN_DIR/calibrated_evaluation"
+mkdir -p "$EVAL_DIR"
+
+CUDA_VISIBLE_DEVICES=0 python scripts/evaluate_m6a_full_transcript.py \
+  --checkpoint "$BEST_M6A_CKPT" \
+  --data-dir "$MULTISPECIES_M6A_DATA_DIR" \
+  --output-dir "$EVAL_DIR" \
+  --batch-size 1 \
+  --num-workers 8 \
+  --device cuda \
+  --bins 4096 \
+  --threshold-objective f1 \
+  2>&1 | tee "$EVAL_DIR/console.log"
+
+cat "$EVAL_DIR/m6a_calibrated_evaluation.json"
+ls -lh "$EVAL_DIR"
+```
+
+Report test average precision as the primary ranking metric because positive
+m6A labels are sparse. Also report AUROC, precision, recall, and F1 at the
+validation-selected threshold. Accuracy alone is not sufficient. The supplied
+six-species archive contains transcripts with at least one observed m6A site;
+this source-selection caveat must be stated in any manuscript or presentation.
+
+A finished experiment should retain these files:
+
+```text
+$RUN_DIR/run_manifest.txt
+$RUN_DIR/console.log
+$RUN_DIR/time.txt
+$RUN_DIR/checkpoints_best/val_m6a_ap.ckpt
+$RUN_DIR/calibrated_evaluation/m6a_calibrated_evaluation.json
+$RUN_DIR/calibrated_evaluation/rna_mamba_m6a_calibrated_evaluation.pdf
+```
+
+For the complete data contract, optional human/mouse extension, and exact
+per-species counts, see [`docs/MULTISPECIES_M6A.md`](docs/MULTISPECIES_M6A.md).
+
+## Completed 5M-sequence pretraining record
+
+The production corpus contract is **3,000,000 RNAcentral non-coding RNA
 records plus approximately 2,000,000 coding-RNA records**, with complete
 sequences up to 10,240 nt. The coding pool uses independent full-mRNA records
 from 45 eukaryotic species, human and mouse, plus prokaryotic CDS records. Its
@@ -23,7 +376,9 @@ script, data audit, exact epoch-to-step calculation, eight-GPU launcher,
 resource estimate, and resume procedure are documented in
 [`docs/PRETRAINING_5M.md`](docs/PRETRAINING_5M.md).
 
-Minimal entry points:
+The following entry points reproduce corpus preparation and pretraining from
+scratch; they are not required before the next m6A run when the completed best
+checkpoint is already available:
 
 ```bash
 python scripts/organize_rna_data.py \
@@ -40,15 +395,16 @@ python scripts/prepare_pretraining_5m.py \
 
 export RNA_PRETRAIN_INDEXED_DIR=/path/to/data/processed/rna_pretraining_5m
 export RUN_DIR=/path/to/runs/rna_pretraining_5m
-export PRETRAIN_EPOCHS=2
+export PRETRAIN_EPOCHS=3
+export PRECISION=bf16
 bash scripts/run_pretrain_5m_8gpu.sh
 ```
 
-With the default 98/1/1 split and global batch 16, the expected five-million
-record corpus needs approximately 306,250 optimizer steps per complete pass
-and about 612,500 steps for the initial two-epoch plan. Because coding records
-are filtered and deduplicated, the launcher reads the exact training count
-from `manifest.json` and calculates the real values automatically.
+The completed manifest produced exactly 301,655 optimizer steps per corpus
+pass at global batch 16, and 904,965 steps for three passes. Because coding
+records are filtered and deduplicated, the launcher always reads the exact
+training count from `manifest.json` and calculates the real values rather than
+relying on a rounded five-million estimate.
 
 ### Completed eight-GPU pretraining run
 
@@ -78,8 +434,8 @@ train/validation/test sizes are 70,891 / 8,851 / 8,871 complete transcripts.
 
 Preparation streams directly from the canonical source archives, validates
 `complete mRNA = 5'UTR + CDS + 3'UTR`, checks every positive label is on A, and
-uses species-qualified gene- and exact-sequence-disjoint splits. Commands, per-species counts,
-label semantics, audit assertions, and the fine-tuning command are in
+uses species-qualified gene- and exact-sequence-disjoint splits. Commands,
+per-species counts, label semantics, audit assertions, and the fine-tuning command are in
 [`docs/MULTISPECIES_M6A.md`](docs/MULTISPECIES_M6A.md). This remains a separate
 fine-tuning stage; its labels are not used during 5M RNA MLM pretraining.
 The final audit found 89,423 exact-sequence groups; duplicate records are kept

@@ -195,7 +195,7 @@ CUDA_VISIBLE_DEVICES=0 python -m train \
 
 The formal default is a from-scratch 12-layer, 768-dimensional RNA-Mamba with
 about 49M trainable parameters, character-level MLM, 15% masking, a 10,240-nt
-maximum sequence length, FP16, and the current lightweight BCW/cross-layer
+maximum sequence length, BF16, and the current lightweight BCW/cross-layer
 memory configuration. m6A labels are not inputs or targets in this stage.
 
 | Item | Formal setting |
@@ -207,7 +207,7 @@ memory configuration. m6A labels are not inputs or targets in this stage.
 | Cross-batch state | disabled (`memory_persist_across_batches=false`) |
 | Objective | same-position character MLM; 15% eligible bases selected |
 | Maximum length | 10,240 nt; dynamic right padding; no truncation |
-| Precision | FP16 |
+| Precision | BF16 (`trainer.precision=bf16`) |
 | Optimizer | AdamW, LR `8e-5`, weight decay `0.01`, betas `[0.9, 0.98]` |
 | Scheduler | cosine decay over the exact run, 20k warmup steps, minimum LR `2e-5` |
 | Default global batch | 16 sequences (`8 GPUs x 1 x accumulation 2`) |
@@ -225,6 +225,7 @@ export BATCH_SIZE=1
 export GRAD_ACCUM=2
 export NUM_WORKERS=4
 export PRETRAIN_EPOCHS=2
+export PRECISION=bf16
 
 bash scripts/run_pretrain_5m_8gpu.sh
 ```
@@ -299,6 +300,7 @@ runs/rna_pretraining_5m/checkpoints_best/val_loss.ckpt
 runs/rna_pretraining_5m/checkpoints/last.ckpt
 ```
 
-Fine-tuning is intentionally a separate later decision. At that point the m6A
-tables can be processed and the best pretraining checkpoint loaded into the
-nucleotide-level classification model.
+Fine-tuning is intentionally a separate stage. The production six-species
+data contract, preparation audit, and eight-GPU launcher are documented in
+[`MULTISPECIES_M6A.md`](MULTISPECIES_M6A.md); initialize that stage from the
+best pretraining `val_loss.ckpt`.

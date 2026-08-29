@@ -49,7 +49,8 @@ trainer:
   accelerator: gpu
   devices: 8
   num_nodes: 1
-  precision: 16
+  # BF16 is the validated stable precision on the eight-H200 production run.
+  precision: bf16
   max_epochs: null
   # The launcher derives this from corpus size, global batch and epoch target.
   max_steps: 612500
